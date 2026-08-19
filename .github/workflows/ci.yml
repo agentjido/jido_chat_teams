@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    uses: agentjido/github-actions/.github/workflows/elixir-lint.yml@v3
+    with:
+      otp_version: "27.3"
+      elixir_version: "1.18.4"
+      validate_hex_package: false
+
+  test:
+    name: Test
+    uses: agentjido/github-actions/.github/workflows/elixir-test.yml@v3
+    with:
+      otp_versions: '["27.3"]'
+      elixir_versions: '["1.18.4"]'
+      test_command: mix test

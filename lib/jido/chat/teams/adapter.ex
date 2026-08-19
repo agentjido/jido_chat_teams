@@ -1,0 +1,677 @@
+defmodule Jido.Chat.Teams.Adapter do
+  @moduledoc """
+  Microsoft Teams `Jido.Chat.Adapter` implementation.
+
+  Live messages use Microsoft Bot Connector Activity Protocol endpoints. The
+  adapter keeps Microsoft Graph out of the required message path.
+  """
+
+  use Jido.Chat.Adapter
+
+  alias Jido.Chat.{
+    ActionEvent,
+    ChannelInfo,
+    EventEnvelope,
+    Incoming,
+    PostPayload,
+    ReactionEvent,
+    Response,
+    WebhookRequest,
+    WebhookResponse
+  }
+
+  alias Jido.Chat.Teams.{CardRenderer, ConversationRef}
+  alias Jido.Chat.Teams.Auth.JwtVerifier
+  alias Jido.Chat.Teams.Transport.ReqClient
+
+  @card_content_type "application/vnd.microsoft.card.adaptive"
+
+  @impl true
+  def channel_type, do: :teams
+
+  @impl true
+  @spec capabilities() :: map()
+  def capabilities do
+    %{
+      initialize: :fallback,
+      shutdown: :fallback,
+      send_message: :native,
+      send_file: :unsupported,
+      post_message: :native,
+      edit_message: :native,
+      delete_message: :native,
+      start_typing: :native,
+      fetch_metadata: :fallback,
+      fetch_thread: :fallback,
+      fetch_message: :unsupported,
+      add_reaction: :unsupported,
+      remove_reaction: :unsupported,
+      post_ephemeral: :unsupported,
+      open_dm: :unsupported,
+      fetch_messages: :unsupported,
+      fetch_channel_messages: :unsupported,
+      list_threads: :unsupported,
+      open_thread: :unsupported,
+      post_channel_message: :unsupported,
+      stream: :fallback,
+      open_modal: :unsupported,
+      webhook: :native,
+      verify_webhook: :native,
+      parse_event: :native,
+      format_webhook_response: :native,
+      text: :native,
+      markdown: :fallback,
+      cards: :native,
+      image: :unsupported,
+      audio: :unsupported,
+      video: :unsupported,
+      file: :unsupported,
+      multi_file: :unsupported,
+      ephemeral: :unsupported,
+      assistant_events: :unsupported
+    }
+  end
+
+  @impl true
+  def listener_child_specs(_bridge_id, _opts \\ []), do: {:ok, []}
+
+  @impl true
+  def transform_incoming(payload) when is_map(payload) do
+    with type when type in ["message", "messageUpdate", "messageDelete"] <- value(payload, :type),
+         {:ok, reference} <- conversation_reference(payload),
+         room_id when is_binary(room_id) <- external_room_id(reference),
+         message_id when is_binary(message_id) <- stringify(value(payload, :id)) do
+      mentions = parse_mentions(payload)
+      bot_id = value(value(payload, :recipient) || %{}, :id)
+      was_mentioned = Enum.any?(mentions, &(&1.is_self == true))
+      text = payload |> value(:text) |> clean_text(mentions)
+      chat_type = chat_type(reference.scope)
+      thread_id = if reference.scope == :channel, do: reference.conversation_id
+      delivery_reference = ConversationRef.encode(reference)
+      from = value(payload, :from) || %{}
+
+      {:ok,
+       Incoming.new(%{
+         external_room_id: room_id,
+         external_user_id: value(from, :aadObjectId) || value(from, :id),
+         text: text,
+         username: value(from, :name),
+         display_name: value(from, :name),
+         external_message_id: message_id,
+         external_reply_to_id: stringify(value(payload, :replyToId)),
+         external_thread_id: thread_id,
+         delivery_external_room_id: delivery_reference,
+         timestamp: value(payload, :timestamp) || value(payload, :localTimestamp),
+         chat_type: chat_type,
+         chat_title: chat_title(payload),
+         was_mentioned: was_mentioned,
+         mentions: mentions,
+         media: extract_media(payload),
+         channel_meta: %{
+           adapter_name: :teams,
+           external_room_id: room_id,
+           external_thread_id: thread_id,
+           delivery_external_room_id: delivery_reference,
+           chat_type: chat_type,
+           chat_title: chat_title(payload),
+           is_dm: reference.scope == :personal,
+           metadata: %{
+             tenant_id: reference.tenant_id,
+             team_id: reference.team_id,
+             channel_id: reference.channel_id,
+             conversation_id: reference.conversation_id,
+             service_url: reference.service_url,
+             bot_id: bot_id,
+             activity_type: type
+           }
+         },
+         raw: normalize_struct(payload),
+         metadata: %{
+           tenant_id: reference.tenant_id,
+           team_id: reference.team_id,
+           channel_id: reference.channel_id,
+           conversation_id: reference.conversation_id,
+           activity_type: type
+         }
+       })}
+    else
+      nil -> {:error, :invalid_activity}
+      type when is_binary(type) -> {:error, {:unsupported_activity_type, type}}
+      {:error, _reason} = error -> error
+      _other -> {:error, :invalid_activity}
+    end
+  end
+
+  def transform_incoming(_payload), do: {:error, :invalid_activity}
+
+  @impl true
+  def send_message(external_room_id, text, opts \\ []) when is_binary(text) do
+    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+         activity <- message_activity(text, opts),
+         {:ok, result} <- send_activity(reference, activity, opts) do
+      {:ok, response(reference, external_room_id, result, :sent)}
+    end
+  end
+
+  @impl true
+  def post_message(external_room_id, %PostPayload{} = payload, opts \\ []) do
+    cond do
+      PostPayload.upload_candidates(payload) != [] ->
+        {:error, :attachments_unsupported}
+
+      payload.kind == :card ->
+        with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+             {:ok, card} <- render_card(payload.card || payload.raw),
+             activity <- card_activity(card, payload, opts),
+             {:ok, result} <- send_activity(reference, activity, opts) do
+          {:ok, response(reference, external_room_id, result, :sent)}
+        end
+
+      payload.kind == :raw and is_map(payload.raw) ->
+        with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+             {:ok, result} <- send_activity(reference, normalize_struct(payload.raw), opts) do
+          {:ok, response(reference, external_room_id, result, :sent)}
+        end
+
+      true ->
+        send_message(external_room_id, PostPayload.display_text(payload) || "", opts)
+    end
+  end
+
+  @impl true
+  def edit_message(external_room_id, message_id, text, opts \\ []) when is_binary(text) do
+    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+         {:ok, result} <-
+           transport(opts).update_activity(
+             reference,
+             stringify(message_id),
+             message_activity(text, opts),
+             opts
+           ) do
+      {:ok, response(reference, external_room_id, put_result_id(result, message_id), :edited)}
+    end
+  end
+
+  @impl true
+  def delete_message(external_room_id, message_id, opts \\ []) do
+    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+         {:ok, _result} <-
+           transport(opts).delete_activity(reference, stringify(message_id), opts) do
+      :ok
+    end
+  end
+
+  @impl true
+  def start_typing(external_room_id, opts \\ []) do
+    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+         {:ok, _result} <- transport(opts).send_activity(reference, %{"type" => "typing"}, opts) do
+      :ok
+    end
+  end
+
+  @impl true
+  def fetch_metadata(external_room_id, opts \\ []) do
+    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts) do
+      {:ok,
+       ChannelInfo.new(%{
+         id: reference.channel_id || reference.conversation_id,
+         is_dm: reference.scope == :personal,
+         metadata: ConversationRef.to_map(reference)
+       })}
+    end
+  end
+
+  @impl true
+  def fetch_thread(external_room_id, opts \\ []) do
+    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts) do
+      {:ok,
+       %{
+         id: "team:#{reference.conversation_id}",
+         adapter_name: :teams,
+         adapter: __MODULE__,
+         external_room_id: external_room_id,
+         external_thread_id:
+           opts[:external_thread_id] ||
+             if(reference.scope == :channel, do: reference.conversation_id),
+         is_dm: reference.scope == :personal,
+         metadata: %{conversation_ref: ConversationRef.to_map(reference)}
+       }}
+    end
+  end
+
+  @impl true
+  def verify_webhook(%WebhookRequest{} = request, opts \\ []) do
+    case Keyword.get(opts, :verifier, JwtVerifier) do
+      verifier when is_atom(verifier) -> verifier.verify(request, opts)
+      verifier when is_function(verifier, 2) -> verifier.(request, opts)
+    end
+  end
+
+  @impl true
+  def parse_event(%WebhookRequest{} = request, _opts \\ []) do
+    payload = request.payload
+
+    case value(payload, :type) do
+      type when type in ["message", "messageUpdate", "messageDelete"] ->
+        with {:ok, incoming} <- transform_incoming(payload) do
+          {:ok,
+           EventEnvelope.new(%{
+             id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
+             adapter_name: :teams,
+             event_type: :message,
+             thread_id: incoming.external_thread_id,
+             channel_id: stringify(incoming.external_room_id),
+             message_id: stringify(incoming.external_message_id),
+             payload: incoming,
+             raw: normalize_struct(payload),
+             metadata: %{activity_type: type}
+           })}
+        end
+
+      "messageReaction" ->
+        parse_reaction_event(payload)
+
+      "invoke" ->
+        parse_action_event(payload)
+
+      type when type in ["conversationUpdate", "installationUpdate", "event", "typing"] ->
+        {:ok, :noop}
+
+      nil ->
+        {:error, :missing_activity_type}
+
+      type ->
+        {:error, {:unsupported_activity_type, type}}
+    end
+  end
+
+  @impl true
+  def format_webhook_response(result, opts \\ [])
+
+  def format_webhook_response({:ok, _chat, _event}, opts) do
+    case Keyword.get(opts, :invoke_response) do
+      nil ->
+        WebhookResponse.new(%{status: 200, headers: %{"content-type" => "text/plain"}, body: ""})
+
+      response ->
+        WebhookResponse.new(%{
+          status: 200,
+          headers: %{"content-type" => "application/json"},
+          body: response
+        })
+    end
+  end
+
+  def format_webhook_response({:error, reason}, _opts)
+      when reason in [
+             :missing_authorization,
+             :invalid_authorization,
+             :invalid_signature,
+             :invalid_issuer,
+             :invalid_audience,
+             :expired_token,
+             :token_not_yet_valid,
+             :service_url_mismatch
+           ] do
+    WebhookResponse.error(401, %{error: to_string(reason)})
+  end
+
+  def format_webhook_response({:error, reason}, _opts) do
+    WebhookResponse.error(400, %{error: inspect(reason)})
+  end
+
+  @impl true
+  def handle_webhook(%Jido.Chat{} = chat, payload, opts \\ []) when is_map(payload) do
+    request =
+      WebhookRequest.new(%{
+        adapter_name: :teams,
+        headers: opts[:headers] || %{},
+        payload: payload,
+        raw: opts[:raw_body] || payload
+      })
+
+    with :ok <- verify_webhook(request, opts),
+         {:ok, event} <- parse_event(request, opts),
+         {:ok, next_chat, incoming} <- route_event(chat, event, opts) do
+      {:ok, next_chat, incoming}
+    end
+  end
+
+  defp route_event(chat, :noop, _opts) do
+    {:ok, chat,
+     Incoming.new(%{
+       external_room_id: "team:noop",
+       external_message_id: Jido.Chat.ID.generate!(),
+       text: nil,
+       metadata: %{noop: true}
+     })}
+  end
+
+  defp route_event(chat, %EventEnvelope{} = envelope, opts) do
+    with {:ok, next_chat, routed_event} <- Jido.Chat.process_event(chat, :teams, envelope, opts) do
+      incoming =
+        case routed_event.payload do
+          %Incoming{} = incoming ->
+            incoming
+
+          _other ->
+            Incoming.new(%{
+              external_room_id: routed_event.channel_id || "team:event",
+              external_message_id: routed_event.message_id || routed_event.id,
+              text: nil,
+              metadata: %{event_type: routed_event.event_type}
+            })
+        end
+
+      {:ok, next_chat, incoming}
+    end
+  end
+
+  defp send_activity(reference, activity, opts) do
+    case opts[:reply_to_id] || opts[:external_reply_to_id] do
+      nil ->
+        transport(opts).send_activity(reference, activity, opts)
+
+      reply_to_id ->
+        transport(opts).reply_to_activity(reference, stringify(reply_to_id), activity, opts)
+    end
+  end
+
+  defp transport(opts), do: Keyword.get(opts, :transport, ReqClient)
+
+  defp message_activity(text, opts) do
+    %{
+      "type" => "message",
+      "text" => text,
+      "textFormat" => Keyword.get(opts, :text_format, "markdown")
+    }
+    |> maybe_put("entities", opts[:entities])
+    |> maybe_put("channelData", opts[:channel_data])
+  end
+
+  defp card_activity(card, payload, opts) do
+    %{
+      "type" => "message",
+      "text" => PostPayload.display_text(payload) || "",
+      "attachments" => [
+        %{
+          "contentType" => @card_content_type,
+          "content" => card
+        }
+      ]
+    }
+    |> maybe_put("channelData", opts[:channel_data])
+  end
+
+  defp render_card(nil), do: {:error, :missing_card}
+
+  defp render_card(card) do
+    {:ok, CardRenderer.render(card)}
+  rescue
+    _exception -> {:error, :invalid_card}
+  end
+
+  defp response(reference, external_room_id, result, status) do
+    message_id = value(result, :id) || value(result, :activityId)
+
+    Response.new(%{
+      external_message_id: message_id,
+      external_room_id: external_room_id,
+      channel_type: :teams,
+      status: status,
+      raw: result,
+      metadata: %{
+        conversation_id: reference.conversation_id,
+        conversation_ref: ConversationRef.encode(reference)
+      }
+    })
+  end
+
+  defp put_result_id(result, message_id) when is_map(result) do
+    if value(result, :id) || value(result, :activityId) do
+      result
+    else
+      Map.put(result, "id", stringify(message_id))
+    end
+  end
+
+  defp conversation_reference(payload) do
+    conversation = value(payload, :conversation) || %{}
+    channel_data = value(payload, :channelData) || %{}
+    tenant = value(channel_data, :tenant) || %{}
+    team = value(channel_data, :team) || %{}
+    channel = value(channel_data, :channel) || %{}
+    recipient = value(payload, :recipient) || %{}
+    from = value(payload, :from) || %{}
+
+    ConversationRef.cast(%{
+      conversation_id: value(conversation, :id),
+      service_url: value(payload, :serviceUrl),
+      tenant_id: value(tenant, :id),
+      scope: activity_scope(conversation, team, channel),
+      team_id: value(team, :id),
+      channel_id: value(channel, :id),
+      bot_id: value(recipient, :id),
+      user_id: value(from, :aadObjectId) || value(from, :id)
+    })
+  end
+
+  defp activity_scope(_conversation, team, channel)
+       when map_size(team) > 0 or map_size(channel) > 0,
+       do: :channel
+
+  defp activity_scope(conversation, _team, _channel) do
+    case value(conversation, :conversationType) do
+      "personal" -> :personal
+      "groupChat" -> :group_chat
+      "channel" -> :channel
+      _other -> nil
+    end
+  end
+
+  defp external_room_id(%ConversationRef{scope: :channel} = reference) do
+    reference.channel_id || reference.team_id || reference.conversation_id
+  end
+
+  defp external_room_id(%ConversationRef{} = reference), do: reference.conversation_id
+
+  defp chat_type(:personal), do: :private
+  defp chat_type(:group_chat), do: :group
+  defp chat_type(:channel), do: :channel
+  defp chat_type(_scope), do: :private
+
+  defp chat_title(payload) do
+    channel_data = value(payload, :channelData) || %{}
+    channel = value(channel_data, :channel) || %{}
+    team = value(channel_data, :team) || %{}
+    value(channel, :name) || value(team, :name)
+  end
+
+  defp parse_mentions(payload) do
+    recipient_id = value(value(payload, :recipient) || %{}, :id)
+
+    payload
+    |> value(:entities)
+    |> List.wrap()
+    |> Enum.flat_map(fn entity ->
+      if value(entity, :type) == "mention" do
+        mentioned = value(entity, :mentioned) || %{}
+        user_id = stringify(value(mentioned, :id))
+
+        [
+          %{
+            user_id: user_id,
+            username: value(mentioned, :name),
+            display_name: value(mentioned, :name),
+            mention_text: value(entity, :text),
+            is_self: not is_nil(user_id) and user_id == stringify(recipient_id),
+            metadata: %{}
+          }
+        ]
+      else
+        []
+      end
+    end)
+  end
+
+  defp clean_text(text, mentions) when is_binary(text) do
+    mentions
+    |> Enum.filter(& &1.is_self)
+    |> Enum.reduce(text, fn mention, acc ->
+      case mention.mention_text do
+        mention_text when is_binary(mention_text) -> String.replace(acc, mention_text, "")
+        _other -> acc
+      end
+    end)
+    |> String.trim()
+  end
+
+  defp clean_text(_text, _mentions), do: nil
+
+  defp extract_media(payload) do
+    payload
+    |> value(:attachments)
+    |> List.wrap()
+    |> Enum.flat_map(fn attachment ->
+      content_type = value(attachment, :contentType)
+      content_url = value(attachment, :contentUrl)
+
+      if content_type == @card_content_type or not is_binary(content_url) do
+        []
+      else
+        [
+          %{
+            kind: media_kind(content_type),
+            url: content_url,
+            media_type: content_type,
+            filename: value(attachment, :name),
+            metadata: %{content: value(attachment, :content)}
+          }
+        ]
+      end
+    end)
+  end
+
+  defp media_kind("image/" <> _rest), do: :image
+  defp media_kind("audio/" <> _rest), do: :audio
+  defp media_kind("video/" <> _rest), do: :video
+  defp media_kind(_content_type), do: :file
+
+  defp parse_reaction_event(payload) do
+    added = value(payload, :reactionsAdded) |> List.wrap()
+    removed = value(payload, :reactionsRemoved) |> List.wrap()
+
+    {reaction, added?} =
+      if added == [], do: {List.first(removed), false}, else: {List.first(added), true}
+
+    if is_map(reaction) do
+      conversation = value(payload, :conversation) || %{}
+      from = value(payload, :from) || %{}
+      activity_id = stringify(value(payload, :replyToId) || value(payload, :id))
+      channel_id = conversation |> value(:id) |> stringify()
+
+      event =
+        ReactionEvent.new(%{
+          adapter: __MODULE__,
+          adapter_name: :teams,
+          thread_id: channel_id,
+          channel_id: channel_id,
+          message_id: activity_id,
+          emoji: stringify(value(reaction, :type)),
+          added: added?,
+          user: %{
+            user_id: stringify(value(from, :aadObjectId) || value(from, :id)),
+            user_name: value(from, :name)
+          },
+          raw: normalize_struct(payload),
+          metadata: %{reactions_added: added, reactions_removed: removed}
+        })
+
+      {:ok,
+       EventEnvelope.new(%{
+         id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
+         adapter_name: :teams,
+         event_type: :reaction,
+         thread_id: channel_id,
+         channel_id: channel_id,
+         message_id: activity_id,
+         payload: event,
+         raw: normalize_struct(payload)
+       })}
+    else
+      {:error, :missing_reaction}
+    end
+  end
+
+  defp parse_action_event(payload) do
+    conversation = value(payload, :conversation) || %{}
+    from = value(payload, :from) || %{}
+    raw_value = value(payload, :value) || %{}
+    action = value(raw_value, :action) || raw_value
+    channel_id = stringify(value(conversation, :id))
+    message_id = stringify(value(payload, :replyToId) || value(payload, :id))
+
+    event =
+      ActionEvent.new(%{
+        adapter: __MODULE__,
+        adapter_name: :teams,
+        thread_id: channel_id,
+        channel_id: channel_id,
+        message_id: message_id,
+        action_id:
+          stringify(value(action, :verb) || value(action, :action_id) || value(payload, :name)),
+        value: action_value(action),
+        trigger_id: stringify(value(payload, :id)),
+        user: %{
+          user_id: stringify(value(from, :aadObjectId) || value(from, :id)),
+          user_name: value(from, :name)
+        },
+        raw: normalize_struct(payload),
+        metadata: %{invoke_name: value(payload, :name)}
+      })
+
+    {:ok,
+     EventEnvelope.new(%{
+       id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
+       adapter_name: :teams,
+       event_type: :action,
+       thread_id: channel_id,
+       channel_id: channel_id,
+       message_id: message_id,
+       payload: event,
+       raw: normalize_struct(payload)
+     })}
+  end
+
+  defp action_value(value) when is_binary(value), do: value
+
+  defp action_value(value) when is_map(value) do
+    case value(value, :value) do
+      nested when is_binary(nested) -> nested
+      _other -> Jason.encode!(normalize_struct(value))
+    end
+  end
+
+  defp action_value(_value), do: nil
+
+  defp value(map, key) when is_map(map) and is_atom(key) do
+    Map.get(map, key) || Map.get(map, Atom.to_string(key))
+  end
+
+  defp value(_map, _key), do: nil
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp stringify(nil), do: nil
+  defp stringify(value) when is_binary(value), do: value
+  defp stringify(value), do: to_string(value)
+
+  defp normalize_struct(%_{} = struct), do: struct |> Map.from_struct() |> normalize_struct()
+
+  defp normalize_struct(map) when is_map(map),
+    do: Map.new(map, fn {key, value} -> {key, normalize_struct(value)} end)
+
+  defp normalize_struct(list) when is_list(list), do: Enum.map(list, &normalize_struct/1)
+  defp normalize_struct(value), do: value
+end
