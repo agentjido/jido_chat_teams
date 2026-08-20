@@ -71,6 +71,43 @@ defmodule Jido.Chat.Teams.AdapterTest do
     assert incoming.channel_meta.is_dm
   end
 
+  test "normalizes attachments when contentType is missing" do
+    activity =
+      Map.put(channel_activity(), "attachments", [
+        %{
+          "contentType" => "application/vnd.microsoft.card.adaptive",
+          "content" => %{"type" => "AdaptiveCard"}
+        },
+        %{
+          "name" => "explicit.png",
+          "contentType" => "image/png",
+          "contentUrl" => "https://teams.example.test/files/explicit"
+        },
+        %{
+          "name" => "fallback.png",
+          "contentUrl" => "https://teams.example.test/files/fallback"
+        },
+        %{
+          "name" => "archive.unknown",
+          "contentType" => " ",
+          "contentUrl" => "https://teams.example.test/files/unknown"
+        }
+      ])
+
+    assert {:ok, incoming} = Jido.Chat.Teams.Adapter.transform_incoming(activity)
+    assert [explicit, fallback, unknown] = incoming.media
+
+    assert explicit.kind == :image
+    assert explicit.media_type == "image/png"
+
+    assert fallback.kind == :image
+    assert fallback.filename == "fallback.png"
+    assert fallback.media_type == nil
+
+    assert unknown.kind == :file
+    assert unknown.media_type == nil
+  end
+
   test "rejects unsupported activity types" do
     assert {:error, {:unsupported_activity_type, "conversationUpdate"}} =
              Jido.Chat.Teams.Adapter.transform_incoming(%{"type" => "conversationUpdate"})

@@ -533,7 +533,7 @@ defmodule Jido.Chat.Teams.Adapter do
     |> value(:attachments)
     |> List.wrap()
     |> Enum.flat_map(fn attachment ->
-      content_type = value(attachment, :contentType)
+      content_type = attachment |> value(:contentType) |> non_empty_string()
       content_url = value(attachment, :contentUrl)
 
       if content_type == @card_content_type or not is_binary(content_url) do
@@ -541,7 +541,6 @@ defmodule Jido.Chat.Teams.Adapter do
       else
         [
           %{
-            kind: media_kind(content_type),
             url: content_url,
             media_type: content_type,
             filename: value(attachment, :name),
@@ -552,10 +551,14 @@ defmodule Jido.Chat.Teams.Adapter do
     end)
   end
 
-  defp media_kind("image/" <> _rest), do: :image
-  defp media_kind("audio/" <> _rest), do: :audio
-  defp media_kind("video/" <> _rest), do: :video
-  defp media_kind(_content_type), do: :file
+  defp non_empty_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp non_empty_string(_value), do: nil
 
   defp parse_reaction_event(payload) do
     added = value(payload, :reactionsAdded) |> List.wrap()
