@@ -71,6 +71,59 @@ defmodule Jido.Chat.Teams.AdapterTest do
     assert incoming.channel_meta.is_dm
   end
 
+  test "normalizes attachments when contentType is missing" do
+    activity =
+      Map.put(channel_activity(), "attachments", [
+        %{
+          "contentType" => " APPLICATION/VND.MICROSOFT.CARD.ADAPTIVE ",
+          "content" => %{"type" => "AdaptiveCard"}
+        },
+        %{
+          "name" => "explicit.png",
+          "contentType" => "image/png",
+          "contentUrl" => "https://teams.example.test/files/explicit"
+        },
+        %{
+          "name" => "fallback.png",
+          "contentUrl" => "https://teams.example.test/files/fallback"
+        },
+        %{
+          "name" => "archive.unknown",
+          "contentType" => " ",
+          "contentUrl" => "https://teams.example.test/files/unknown"
+        },
+        %{
+          "name" => " ",
+          "contentUrl" => "https://teams.example.test/files/photo.PNG?token=signed"
+        },
+        %{
+          "name" => "misleading.png",
+          "contentType" => " application/pdf; charset=binary ",
+          "contentUrl" => "https://teams.example.test/files/misleading"
+        }
+      ])
+
+    assert {:ok, incoming} = Jido.Chat.Teams.Adapter.transform_incoming(activity)
+    assert [explicit, fallback, unknown, signed_url, misleading] = incoming.media
+
+    assert explicit.kind == :image
+    assert explicit.media_type == "image/png"
+
+    assert fallback.kind == :image
+    assert fallback.filename == "fallback.png"
+    assert fallback.media_type == nil
+
+    assert unknown.kind == :file
+    assert unknown.media_type == nil
+
+    assert signed_url.kind == :image
+    assert signed_url.filename == nil
+    assert signed_url.media_type == nil
+
+    assert misleading.kind == :file
+    assert misleading.media_type == "application/pdf; charset=binary"
+  end
+
   test "rejects unsupported activity types" do
     assert {:error, {:unsupported_activity_type, "conversationUpdate"}} =
              Jido.Chat.Teams.Adapter.transform_incoming(%{"type" => "conversationUpdate"})
