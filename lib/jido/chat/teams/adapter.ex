@@ -25,6 +25,33 @@ defmodule Jido.Chat.Teams.Adapter do
   alias Jido.Chat.Teams.Transport.ReqClient
 
   @card_content_type "application/vnd.microsoft.card.adaptive"
+  @media_type_pattern ~r/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/
+  @media_kind_extensions %{
+    ".aac" => :audio,
+    ".avi" => :video,
+    ".avif" => :image,
+    ".bmp" => :image,
+    ".flac" => :audio,
+    ".gif" => :image,
+    ".heic" => :image,
+    ".heif" => :image,
+    ".jpeg" => :image,
+    ".jpg" => :image,
+    ".m4a" => :audio,
+    ".m4v" => :video,
+    ".mkv" => :video,
+    ".mov" => :video,
+    ".mp3" => :audio,
+    ".mp4" => :video,
+    ".ogg" => :audio,
+    ".png" => :image,
+    ".svg" => :image,
+    ".tif" => :image,
+    ".tiff" => :image,
+    ".wav" => :audio,
+    ".webm" => :video,
+    ".webp" => :image
+  }
 
   @impl true
   def channel_type, do: :teams
@@ -533,17 +560,19 @@ defmodule Jido.Chat.Teams.Adapter do
     |> value(:attachments)
     |> List.wrap()
     |> Enum.flat_map(fn attachment ->
-      content_type = attachment |> value(:contentType) |> non_empty_string()
-      content_url = value(attachment, :contentUrl)
+      content_type = attachment |> value(:contentType) |> normalize_media_type()
+      content_url = attachment |> value(:contentUrl) |> blank_to_nil()
+      filename = attachment |> value(:name) |> blank_to_nil()
 
-      if content_type == @card_content_type or not is_binary(content_url) do
+      if card_content_type?(content_type) or is_nil(content_url) do
         []
       else
         [
           %{
+            kind: attachment_kind(content_type, filename, content_url),
             url: content_url,
             media_type: content_type,
-            filename: value(attachment, :name),
+            filename: filename,
             metadata: %{content: value(attachment, :content)}
           }
         ]
@@ -551,14 +580,64 @@ defmodule Jido.Chat.Teams.Adapter do
     end)
   end
 
-  defp non_empty_string(value) when is_binary(value) do
-    case String.trim(value) do
-      "" -> nil
-      trimmed -> trimmed
+  defp card_content_type?(nil), do: false
+
+  defp card_content_type?(content_type),
+    do: canonical_media_type(content_type) == @card_content_type
+
+  defp attachment_kind(media_type, filename, url) do
+    media_kind_from_type(media_type) ||
+      media_kind_from_reference(filename) ||
+      media_kind_from_reference(url) ||
+      :file
+  end
+
+  defp media_kind_from_type(media_type) when is_binary(media_type) do
+    case canonical_media_type(media_type) do
+      "image/" <> _rest -> :image
+      "audio/" <> _rest -> :audio
+      "video/" <> _rest -> :video
+      _other -> :file
     end
   end
 
-  defp non_empty_string(_value), do: nil
+  defp media_kind_from_type(_media_type), do: nil
+
+  defp media_kind_from_reference(reference) when is_binary(reference) do
+    reference
+    |> URI.parse()
+    |> Map.get(:path)
+    |> case do
+      path when is_binary(path) -> path |> Path.extname() |> String.downcase()
+      _other -> ""
+    end
+    |> then(&Map.get(@media_kind_extensions, &1))
+  end
+
+  defp media_kind_from_reference(_reference), do: nil
+
+  defp normalize_media_type(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    if Regex.match?(@media_type_pattern, canonical_media_type(trimmed)),
+      do: trimmed,
+      else: nil
+  end
+
+  defp normalize_media_type(_value), do: nil
+
+  defp canonical_media_type(value) do
+    value
+    |> String.split(";", parts: 2)
+    |> hd()
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp blank_to_nil(value) when is_binary(value),
+    do: if(String.trim(value) == "", do: nil, else: value)
+
+  defp blank_to_nil(_value), do: nil
 
   defp parse_reaction_event(payload) do
     added = value(payload, :reactionsAdded) |> List.wrap()

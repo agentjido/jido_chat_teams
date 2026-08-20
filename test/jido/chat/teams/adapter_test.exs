@@ -75,7 +75,7 @@ defmodule Jido.Chat.Teams.AdapterTest do
     activity =
       Map.put(channel_activity(), "attachments", [
         %{
-          "contentType" => "application/vnd.microsoft.card.adaptive",
+          "contentType" => " APPLICATION/VND.MICROSOFT.CARD.ADAPTIVE ",
           "content" => %{"type" => "AdaptiveCard"}
         },
         %{
@@ -91,11 +91,20 @@ defmodule Jido.Chat.Teams.AdapterTest do
           "name" => "archive.unknown",
           "contentType" => " ",
           "contentUrl" => "https://teams.example.test/files/unknown"
+        },
+        %{
+          "name" => " ",
+          "contentUrl" => "https://teams.example.test/files/photo.PNG?token=signed"
+        },
+        %{
+          "name" => "misleading.png",
+          "contentType" => " application/pdf; charset=binary ",
+          "contentUrl" => "https://teams.example.test/files/misleading"
         }
       ])
 
     assert {:ok, incoming} = Jido.Chat.Teams.Adapter.transform_incoming(activity)
-    assert [explicit, fallback, unknown] = incoming.media
+    assert [explicit, fallback, unknown, signed_url, misleading] = incoming.media
 
     assert explicit.kind == :image
     assert explicit.media_type == "image/png"
@@ -106,6 +115,13 @@ defmodule Jido.Chat.Teams.AdapterTest do
 
     assert unknown.kind == :file
     assert unknown.media_type == nil
+
+    assert signed_url.kind == :image
+    assert signed_url.filename == nil
+    assert signed_url.media_type == nil
+
+    assert misleading.kind == :file
+    assert misleading.media_type == "application/pdf; charset=binary"
   end
 
   test "rejects unsupported activity types" do
