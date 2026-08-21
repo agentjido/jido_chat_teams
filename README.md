@@ -17,14 +17,17 @@ The spike includes these functions:
 - Send, reply to, edit, and delete text messages.
 - Send typing activities.
 - Render `Jido.Chat.Card` data as Adaptive Cards.
+- Render native pie, bar, and line charts, native tables, and readable fallbacks.
+- Render canonical date, number, and dynamic-select modal inputs for Teams dialogs.
+- Normalize Teams dynamic-search invokes and responses.
 - Parse message reaction and Adaptive Card invoke activities.
 - Run deterministic protocol and security tests with no Microsoft account.
 - Run an optional live suite after you add credentials and a conversation reference.
 
 The spike does not include files, Graph history, proactive conversation creation,
-ephemeral messages, or modal windows. Reaction activities are parsed, but the
-adapter does not add or remove reactions. Microsoft Graph is not in the normal send
-path.
+ephemeral messages, or opening modal windows without an invoke activity. Reaction
+activities are parsed, but the adapter does not add or remove reactions. Microsoft
+Graph is not in the normal send path.
 
 ## Install
 
@@ -127,6 +130,41 @@ Jido.Chat.Teams.Adapter.post_message(delivery_external_room_id, payload, opts)
 
 The adapter also accepts a raw Adaptive Card map with `"type" => "AdaptiveCard"`.
 
+Teams renders pie, bar, and line charts as native Adaptive Card chart elements.
+Area charts use the canonical text fallback because Teams has no area chart element.
+Tables render one page and include a row-count note when more rows exist. Link actions
+keep their canonical stable IDs in the Adaptive Card payload.
+
+## Modal cards and dynamic options
+
+`Jido.Chat.Teams.ModalRenderer.render/1` converts a canonical `Jido.Chat.Modal` into
+an Adaptive Card for a Teams dialog response. Date inputs are native. Number inputs
+are native unless they use `step`, which Teams cannot enforce. Dynamic selects use
+Teams `Data.Query` typeahead controls. Opening a dialog still needs a verified invoke
+activity, so `Adapter.open_modal/3` remains unsupported.
+
+Teams sends a dynamic query as an `application/search` invoke. `Adapter.parse_event/2`
+normalizes it to `Jido.Chat.OptionsLoadEvent`. Configure an option loader when you
+process the event:
+
+```elixir
+loader = fn event, _opts ->
+  {:ok, %{options: [%{label: "Ada", value: "user:ada"}]}}
+end
+
+{:ok, result} =
+  Jido.Chat.Teams.Adapter.load_options(event,
+    options_loader: loader
+  )
+
+response = Jido.Chat.Teams.Adapter.format_options_load_response({:ok, result})
+```
+
+The loader can be a function of arity one or two, or an MFA tuple. The adapter
+enforces the Teams maximum of 15 dynamic options. Teams dynamic-search responses do
+not support option groups, so the adapter returns a typed error for them. The event
+timeout, loader errors, and provider-limit errors remain typed.
+
 ## Microsoft app setup
 
 The [`appPackage/manifest.json`](appPackage/manifest.json) file is a development
@@ -193,3 +231,5 @@ deletes the test data. Use a dedicated tenant, team, and channel.
   caller must wait for this interval before it tries again.
 - Long work must return an HTTP success response quickly and do later delivery with
   the stored conversation reference.
+- Teams dynamic typeahead controls return at most 15 options and do not return option
+  groups.
