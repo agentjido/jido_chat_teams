@@ -46,7 +46,7 @@ defmodule Jido.Chat.Teams.MixProject do
 
   defp deps do
     [
-      {:jido_chat, "~> 1.1"},
+      {:jido_chat, "~> 1.2"},
       {:req, "~> 0.7"},
       {:jason, "~> 1.4"},
       {:jose, "~> 1.11"},

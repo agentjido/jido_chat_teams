@@ -13,6 +13,9 @@ defmodule Jido.Chat.Teams.Adapter do
     ChannelInfo,
     EventEnvelope,
     Incoming,
+    OptionsLoadError,
+    OptionsLoadEvent,
+    OptionsLoadResult,
     PostPayload,
     ReactionEvent,
     Response,
@@ -25,6 +28,7 @@ defmodule Jido.Chat.Teams.Adapter do
   alias Jido.Chat.Teams.Transport.ReqClient
 
   @card_content_type "application/vnd.microsoft.card.adaptive"
+  @default_options_timeout_ms 3_000
   @media_type_pattern ~r/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/
   @media_kind_extensions %{
     ".aac" => :audio,
@@ -82,6 +86,7 @@ defmodule Jido.Chat.Teams.Adapter do
       post_channel_message: :unsupported,
       stream: :fallback,
       open_modal: :unsupported,
+      load_options: :native,
       webhook: :native,
       verify_webhook: :native,
       parse_event: :native,
@@ -89,6 +94,13 @@ defmodule Jido.Chat.Teams.Adapter do
       text: :native,
       markdown: :fallback,
       cards: :native,
+      card_charts: :fallback,
+      card_tables: :native,
+      modal_date_input: :native,
+      modal_number_input: :fallback,
+      external_select: :native,
+      options_load: :native,
+      link_action_ids: :native,
       image: :unsupported,
       audio: :unsupported,
       video: :unsupported,
@@ -267,6 +279,20 @@ defmodule Jido.Chat.Teams.Adapter do
   end
 
   @impl true
+  def load_options(%OptionsLoadEvent{} = event, opts \\ []) do
+    timeout_ms =
+      opts[:timeout_ms] || opts[:options_timeout_ms] || event.timeout_ms ||
+        @default_options_timeout_ms
+
+    with {:ok, loader} <- fetch_options_loader(opts),
+         {:ok, result} <- call_options_loader(loader, event, opts, timeout_ms),
+         {:ok, result} <- normalize_options_result(result, timeout_ms),
+         :ok <- validate_options_result(result, event) do
+      {:ok, result}
+    end
+  end
+
+  @impl true
   def verify_webhook(%WebhookRequest{} = request, opts \\ []) do
     case Keyword.get(opts, :verifier, JwtVerifier) do
       verifier when is_atom(verifier) -> verifier.verify(request, opts)
@@ -278,8 +304,8 @@ defmodule Jido.Chat.Teams.Adapter do
   def parse_event(%WebhookRequest{} = request, _opts \\ []) do
     payload = request.payload
 
-    case value(payload, :type) do
-      type when type in ["message", "messageUpdate", "messageDelete"] ->
+    case {value(payload, :type), value(payload, :name)} do
+      {type, _name} when type in ["message", "messageUpdate", "messageDelete"] ->
         with {:ok, incoming} <- transform_incoming(payload) do
           {:ok,
            EventEnvelope.new(%{
@@ -295,25 +321,44 @@ defmodule Jido.Chat.Teams.Adapter do
            })}
         end
 
-      "messageReaction" ->
+      {"messageReaction", _name} ->
         parse_reaction_event(payload)
 
-      "invoke" ->
+      {"invoke", "application/search"} ->
+        parse_options_load_event(payload)
+
+      {"invoke", _name} ->
         parse_action_event(payload)
 
-      type when type in ["conversationUpdate", "installationUpdate", "event", "typing"] ->
+      {type, _name}
+      when type in ["conversationUpdate", "installationUpdate", "event", "typing"] ->
         {:ok, :noop}
 
-      nil ->
+      {nil, _name} ->
         {:error, :missing_activity_type}
 
-      type ->
+      {type, _name} ->
         {:error, {:unsupported_activity_type, type}}
     end
   end
 
   @impl true
   def format_webhook_response(result, opts \\ [])
+
+  def format_webhook_response(
+        {:ok, _chat, %EventEnvelope{event_type: :options_load, payload: payload}},
+        _opts
+      ) do
+    format_options_load_response({:ok, payload})
+  end
+
+  def format_webhook_response({:ok, %OptionsLoadResult{} = result}, _opts) do
+    format_options_load_response({:ok, result})
+  end
+
+  def format_webhook_response({:error, %OptionsLoadError{} = error}, _opts) do
+    format_options_load_response({:error, error})
+  end
 
   def format_webhook_response({:ok, _chat, _event}, opts) do
     case Keyword.get(opts, :invoke_response) do
@@ -345,6 +390,43 @@ defmodule Jido.Chat.Teams.Adapter do
 
   def format_webhook_response({:error, reason}, _opts) do
     WebhookResponse.error(400, %{error: inspect(reason)})
+  end
+
+  @doc "Formats a typed options-load result as a Teams search invoke response."
+  @spec format_options_load_response(
+          {:ok, OptionsLoadResult.t()}
+          | {:error, OptionsLoadError.t()}
+        ) :: WebhookResponse.t()
+  def format_options_load_response({:ok, %OptionsLoadResult{} = result}) do
+    WebhookResponse.new(%{
+      status: 200,
+      headers: %{"content-type" => "application/json"},
+      body: %{
+        "type" => "application/vnd.microsoft.search.searchResponse",
+        "value" => %{
+          "results" =>
+            Enum.map(result.options, fn option ->
+              %{"title" => option.label, "value" => option.value}
+            end)
+        }
+      }
+    })
+  end
+
+  def format_options_load_response({:error, %OptionsLoadError{} = error}) do
+    status = if(error.kind == :timeout, do: 504, else: 400)
+
+    WebhookResponse.new(%{
+      status: status,
+      headers: %{"content-type" => "application/json"},
+      body: %{
+        "error" => %{
+          "code" => error.code,
+          "message" => error.message,
+          "retryable" => error.retryable
+        }
+      }
+    })
   end
 
   @impl true
@@ -725,6 +807,194 @@ defmodule Jido.Chat.Teams.Adapter do
      })}
   end
 
+  defp parse_options_load_event(payload) do
+    conversation = value(payload, :conversation) || %{}
+    from = value(payload, :from) || %{}
+    request = value(payload, :value) || %{}
+    query_options = value(request, :queryOptions) || %{}
+    channel_id = stringify(value(conversation, :id))
+    message_id = stringify(value(payload, :replyToId) || value(payload, :id))
+
+    dataset = stringify(value(request, :dataset) || value(request, :action_id))
+
+    if is_binary(dataset) and String.trim(dataset) != "" do
+      event =
+        OptionsLoadEvent.new(%{
+          adapter: __MODULE__,
+          adapter_name: :teams,
+          action_id: dataset,
+          query: stringify(value(request, :queryText)) || "",
+          limit: positive_integer(value(query_options, :top)),
+          timeout_ms: positive_integer(value(request, :timeoutMs)),
+          thread_id: channel_id,
+          channel_id: channel_id,
+          message_id: message_id,
+          user: %{
+            user_id: stringify(value(from, :aadObjectId) || value(from, :id)),
+            user_name: value(from, :name)
+          },
+          raw: normalize_struct(payload),
+          metadata: %{
+            associated_inputs: normalize_struct(value(request, :data) || %{}),
+            skip: non_negative_integer(value(query_options, :skip))
+          }
+        })
+
+      {:ok,
+       EventEnvelope.new(%{
+         id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
+         adapter_name: :teams,
+         event_type: :options_load,
+         thread_id: channel_id,
+         channel_id: channel_id,
+         message_id: message_id,
+         payload: event,
+         raw: normalize_struct(payload),
+         metadata: %{invoke_name: "application/search"}
+       })}
+    else
+      {:error, :missing_options_dataset}
+    end
+  end
+
+  defp fetch_options_loader(opts) do
+    case opts[:options_loader] do
+      loader when is_function(loader, 1) or is_function(loader, 2) ->
+        {:ok, loader}
+
+      {module, function, args} = loader
+      when is_atom(module) and is_atom(function) and is_list(args) ->
+        {:ok, loader}
+
+      nil ->
+        {:error, options_error("options_loader_unavailable", "No options loader is configured")}
+
+      _other ->
+        {:error, options_error("invalid_options_loader", "The options loader is invalid")}
+    end
+  end
+
+  defp call_options_loader(loader, event, opts, timeout_ms) do
+    caller = self()
+    reply_ref = make_ref()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        send(caller, {reply_ref, safely_invoke_options_loader(loader, event, opts)})
+      end)
+
+    receive do
+      {^reply_ref, {:ok, result}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:ok, result}
+
+      {^reply_ref, {:error, reason}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, options_loader_error(reason)}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:error, options_loader_error(reason)}
+    after
+      timeout_ms ->
+        Process.exit(pid, :kill)
+        receive do: ({:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok)
+
+        receive do
+          {^reply_ref, _late_result} -> :ok
+        after
+          0 -> :ok
+        end
+
+        {:error, OptionsLoadError.timeout(timeout_ms)}
+    end
+  end
+
+  defp invoke_options_loader(loader, event, opts) when is_function(loader, 2),
+    do: loader.(event, opts)
+
+  defp invoke_options_loader(loader, event, _opts) when is_function(loader, 1),
+    do: loader.(event)
+
+  defp invoke_options_loader({module, function, args}, event, opts),
+    do: apply(module, function, [event, opts | args])
+
+  defp safely_invoke_options_loader(loader, event, opts) do
+    {:ok, invoke_options_loader(loader, event, opts)}
+  rescue
+    exception -> {:error, {exception, __STACKTRACE__}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp normalize_options_result({:ok, %OptionsLoadResult{} = result}, _timeout_ms),
+    do: {:ok, result}
+
+  defp normalize_options_result({:ok, result}, _timeout_ms) when is_map(result) do
+    {:ok, OptionsLoadResult.new(result)}
+  rescue
+    exception -> {:error, options_loader_error(exception)}
+  end
+
+  defp normalize_options_result({:error, %OptionsLoadError{} = error}, _timeout_ms),
+    do: {:error, error}
+
+  defp normalize_options_result({:error, :timeout}, timeout_ms),
+    do: {:error, OptionsLoadError.timeout(timeout_ms)}
+
+  defp normalize_options_result({:error, reason}, _timeout_ms),
+    do: {:error, options_loader_error(reason)}
+
+  defp normalize_options_result(other, _timeout_ms),
+    do:
+      {:error,
+       options_error(
+         "invalid_options_loader_result",
+         "The options loader returned an invalid result",
+         %{result: inspect(other)}
+       )}
+
+  defp validate_options_result(%OptionsLoadResult{option_groups: [_ | _]}, _event) do
+    {:error,
+     options_error(
+       "teams_option_groups_unsupported",
+       "Teams dynamic-search responses do not support option groups"
+     )}
+  end
+
+  defp validate_options_result(%OptionsLoadResult{options: options}, event) do
+    max_choices = CardRenderer.max_choices()
+    limit = min(event.limit || max_choices, max_choices)
+    option_count = length(options)
+
+    if option_count <= limit do
+      :ok
+    else
+      {:error,
+       options_error(
+         "teams_option_limit",
+         "Teams dynamic-search responses support at most #{limit} options",
+         %{actual: option_count, limit: limit}
+       )}
+    end
+  end
+
+  defp options_loader_error(reason) do
+    options_error(
+      "options_loader_error",
+      "The options loader failed",
+      %{reason: inspect(reason)}
+    )
+  end
+
+  defp options_error(code, message, metadata \\ %{}) do
+    OptionsLoadError.new(%{
+      code: code,
+      message: message,
+      retryable: false,
+      metadata: metadata
+    })
+  end
+
   defp action_value(value) when is_binary(value), do: value
 
   defp action_value(value) when is_map(value) do
@@ -735,6 +1005,12 @@ defmodule Jido.Chat.Teams.Adapter do
   end
 
   defp action_value(_value), do: nil
+
+  defp positive_integer(value) when is_integer(value) and value > 0, do: value
+  defp positive_integer(_value), do: nil
+
+  defp non_negative_integer(value) when is_integer(value) and value >= 0, do: value
+  defp non_negative_integer(_value), do: nil
 
   defp value(map, key) when is_map(map) and is_atom(key) do
     Map.get(map, key) || Map.get(map, Atom.to_string(key))
