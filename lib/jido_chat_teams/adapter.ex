@@ -1,0 +1,1432 @@
+defmodule Jido.Chat.Teams.Adapter do
+  @moduledoc "Microsoft Teams `Jido.Chat.Adapter` implementation.\n\nLive messages use Microsoft Bot Connector Activity Protocol endpoints. The\nadapter keeps Microsoft Graph out of the required message path.\n"
+  use Jido.Chat.Adapter
+  alias Jido.Chat.{ChannelInfo, PostPayload, WebhookRequest, WebhookResponse}
+  alias Jido.Chat.Teams.{CardRenderer, ConversationRef}
+  alias Jido.Chat.Teams.Auth.JwtVerifier
+  alias Jido.Chat.Teams.Transport.ReqClient
+  @card_content_type "application/vnd.microsoft.card.adaptive"
+  @default_options_timeout_ms 3000
+  @media_type_pattern ~r/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/
+  @media_kind_extensions %{
+    ".aac" => :audio,
+    ".avi" => :video,
+    ".avif" => :image,
+    ".bmp" => :image,
+    ".flac" => :audio,
+    ".gif" => :image,
+    ".heic" => :image,
+    ".heif" => :image,
+    ".jpeg" => :image,
+    ".jpg" => :image,
+    ".m4a" => :audio,
+    ".m4v" => :video,
+    ".mkv" => :video,
+    ".mov" => :video,
+    ".mp3" => :audio,
+    ".mp4" => :video,
+    ".ogg" => :audio,
+    ".png" => :image,
+    ".svg" => :image,
+    ".tif" => :image,
+    ".tiff" => :image,
+    ".wav" => :audio,
+    ".webm" => :video,
+    ".webp" => :image
+  }
+  @impl true
+  def channel_type do
+    :teams
+  end
+
+  @impl true
+  @spec capabilities() :: map()
+  def capabilities do
+    %{
+      initialize: :fallback,
+      shutdown: :fallback,
+      send_message: :native,
+      send_file: :unsupported,
+      post_message: :native,
+      edit_message: :native,
+      delete_message: :native,
+      start_typing: :native,
+      fetch_metadata: :fallback,
+      fetch_thread: :fallback,
+      fetch_message: :unsupported,
+      add_reaction: :unsupported,
+      remove_reaction: :unsupported,
+      post_ephemeral: :unsupported,
+      open_dm: :unsupported,
+      fetch_messages: :unsupported,
+      fetch_channel_messages: :unsupported,
+      list_threads: :unsupported,
+      open_thread: :unsupported,
+      post_channel_message: :unsupported,
+      stream: :fallback,
+      open_modal: :unsupported,
+      load_options: :native,
+      webhook: :native,
+      verify_webhook: :native,
+      normalize_event: :native,
+      format_webhook_response: :native,
+      text: :native,
+      markdown: :fallback,
+      cards: :native,
+      card_charts: :fallback,
+      card_tables: :native,
+      modal_date_input: :native,
+      modal_number_input: :fallback,
+      external_select: :native,
+      options_load: :native,
+      link_action_ids: :native,
+      image: :unsupported,
+      audio: :unsupported,
+      video: :unsupported,
+      file: :unsupported,
+      multi_file: :unsupported,
+      ephemeral: :unsupported,
+      assistant_events: :unsupported
+    }
+  end
+
+  @impl true
+  def listener_child_specs(_bridge_id, _opts \\ []) do
+    {:ok, []}
+  end
+
+  defp provider_message(payload) when is_map(payload) do
+    with type when type in ["message", "messageUpdate", "messageDelete"] <- value(payload, :type),
+         {:ok, reference} <- conversation_reference(payload),
+         room_id when is_binary(room_id) <- external_room_id(reference),
+         message_id when is_binary(message_id) <- stringify(value(payload, :id)) do
+      mentions = parse_mentions(payload)
+      bot_id = value(value(payload, :recipient) || %{}, :id)
+      was_mentioned = Enum.any?(mentions, &(&1.is_self == true))
+      text = payload |> value(:text) |> clean_text(mentions)
+      chat_type = chat_type(reference.scope)
+
+      thread_id =
+        if reference.scope == :channel do
+          reference.conversation_id
+        end
+
+      delivery_reference = ConversationRef.encode(reference)
+      from = value(payload, :from) || %{}
+
+      {:ok,
+       %{
+         external_room_id: room_id,
+         external_user_id: value(from, :aadObjectId) || value(from, :id),
+         text: text,
+         username: value(from, :name),
+         display_name: value(from, :name),
+         external_message_id: message_id,
+         external_reply_to_id: stringify(value(payload, :replyToId)),
+         external_thread_id: thread_id,
+         delivery_external_room_id: delivery_reference,
+         timestamp: value(payload, :timestamp) || value(payload, :localTimestamp),
+         chat_type: chat_type,
+         chat_title: chat_title(payload),
+         was_mentioned: was_mentioned,
+         mentions: mentions,
+         media: extract_media(payload),
+         channel_meta: %{
+           adapter_name: :teams,
+           external_room_id: room_id,
+           external_thread_id: thread_id,
+           delivery_external_room_id: delivery_reference,
+           chat_type: chat_type,
+           chat_title: chat_title(payload),
+           is_dm: reference.scope == :personal,
+           metadata: %{
+             tenant_id: reference.tenant_id,
+             team_id: reference.team_id,
+             channel_id: reference.channel_id,
+             conversation_id: reference.conversation_id,
+             service_url: reference.service_url,
+             bot_id: bot_id,
+             activity_type: type
+           }
+         },
+         raw: normalize_struct(payload),
+         metadata: %{
+           tenant_id: reference.tenant_id,
+           team_id: reference.team_id,
+           channel_id: reference.channel_id,
+           conversation_id: reference.conversation_id,
+           activity_type: type
+         }
+       }}
+    else
+      nil -> {:error, :invalid_activity}
+      type when is_binary(type) -> {:error, {:unsupported_activity_type, type}}
+      {:error, _reason} = error -> error
+      _other -> {:error, :invalid_activity}
+    end
+  end
+
+  defp provider_message(_payload) do
+    {:error, :invalid_activity}
+  end
+
+  @impl true
+  def send_message(external_room_id, text, opts \\ []) when is_binary(text) do
+    with {:ok, reference} <- delivery_reference(external_room_id, opts),
+         activity <- message_activity(text, opts),
+         {:ok, result} <- send_activity(reference, activity, opts) do
+      {:ok, response(reference, external_room_id, result, :sent)}
+    end
+  end
+
+  @impl true
+  def post_message(external_room_id, %PostPayload{} = payload, opts \\ []) do
+    cond do
+      PostPayload.upload_candidates(payload) != [] ->
+        {:error, :attachments_unsupported}
+
+      payload.kind == :card ->
+        with {:ok, reference} <- delivery_reference(external_room_id, opts),
+             {:ok, card} <- render_card(payload.card || payload.raw),
+             activity <- card_activity(card, payload, opts),
+             {:ok, result} <- send_activity(reference, activity, opts) do
+          {:ok, response(reference, external_room_id, result, :sent)}
+        end
+
+      payload.kind == :raw and is_map(payload.raw) ->
+        with {:ok, reference} <- delivery_reference(external_room_id, opts),
+             {:ok, result} <- send_activity(reference, normalize_struct(payload.raw), opts) do
+          {:ok, response(reference, external_room_id, result, :sent)}
+        end
+
+      true ->
+        send_message(external_room_id, PostPayload.display_text(payload) || "", opts)
+    end
+  end
+
+  @impl true
+  def edit_message(external_room_id, message_id, text, opts \\ []) when is_binary(text) do
+    with {:ok, reference} <- delivery_reference(external_room_id, opts),
+         {:ok, result} <-
+           transport(opts).update_activity(
+             reference,
+             stringify(message_id),
+             message_activity(text, opts),
+             opts
+           ) do
+      {:ok, response(reference, external_room_id, put_result_id(result, message_id), :edited)}
+    end
+  end
+
+  @impl true
+  def delete_message(external_room_id, message_id, opts \\ []) do
+    with {:ok, reference} <- delivery_reference(external_room_id, opts),
+         {:ok, _result} <- transport(opts).delete_activity(reference, stringify(message_id), opts) do
+      :ok
+    end
+  end
+
+  @impl true
+  def start_typing(external_room_id, opts \\ []) do
+    with {:ok, reference} <- delivery_reference(external_room_id, opts),
+         {:ok, _result} <- transport(opts).send_activity(reference, %{"type" => "typing"}, opts) do
+      :ok
+    end
+  end
+
+  @impl true
+  def fetch_metadata(external_room_id, opts \\ []) do
+    with {:ok, reference} <- delivery_reference(external_room_id, opts) do
+      {:ok,
+       ChannelInfo.new(%{
+         id: reference.channel_id || reference.conversation_id,
+         is_dm: reference.scope == :personal,
+         metadata: ConversationRef.to_map(reference)
+       })}
+    end
+  end
+
+  @impl true
+  def fetch_thread(external_room_id, opts \\ []) do
+    with {:ok, reference} <- delivery_reference(external_room_id, opts) do
+      {:ok,
+       %{
+         id: "team:#{reference.conversation_id}",
+         adapter_name: :teams,
+         adapter: __MODULE__,
+         external_room_id: external_room_id,
+         external_thread_id:
+           opts[:external_thread_id] ||
+             if reference.scope == :channel do
+               reference.conversation_id
+             end,
+         is_dm: reference.scope == :personal,
+         metadata: %{conversation_ref: ConversationRef.to_map(reference)}
+       }}
+    end
+  end
+
+  @impl true
+  def load_options(%Jido.Signal{type: "jido.chat.query.load_options"} = event, opts \\ []) do
+    timeout_ms =
+      opts[:timeout_ms] || opts[:options_timeout_ms] || opts[:event_timeout_ms] ||
+        @default_options_timeout_ms
+
+    with {:ok, loader} <- fetch_options_loader(opts),
+         {:ok, result} <- call_options_loader(loader, event, opts, timeout_ms),
+         {:ok, result} <- normalize_options_result(result, timeout_ms),
+         :ok <- validate_options_result(result, event) do
+      {:ok, result}
+    end
+  end
+
+  @impl true
+  def verify_webhook(%WebhookRequest{} = request, opts \\ []) do
+    case Keyword.get(opts, :verifier, JwtVerifier) do
+      verifier when is_atom(verifier) -> verifier.verify(request, opts)
+      verifier when is_function(verifier, 2) -> verifier.(request, opts)
+    end
+  end
+
+  @impl true
+  def format_webhook_response(result, opts \\ [])
+
+  def format_webhook_response({:ok, %Jido.Chat.Delivery{}}, opts) do
+    WebhookResponse.new(%{status: 200, body: opts[:invoke_response] || ""})
+  end
+
+  def format_webhook_response(
+        {:ok,
+         %Jido.Signal{
+           type: "jido.chat.operation.completed",
+           data: %{"operation" => "load_options", "result" => result}
+         }},
+        _opts
+      ) do
+    format_options_load_response({:ok, result})
+  end
+
+  def format_webhook_response(
+        {:ok,
+         %Jido.Signal{
+           type: "jido.chat.operation.failed",
+           data: %{"operation" => "load_options"} = data
+         }},
+        _opts
+      ),
+      do: WebhookResponse.error(if(data["retryable"], do: 504, else: 400), %{error: data["code"]})
+
+  def format_webhook_response({:error, reason}, _opts)
+      when reason in [
+             :missing_authorization,
+             :invalid_authorization,
+             :invalid_signature,
+             :invalid_issuer,
+             :invalid_audience,
+             :expired_token,
+             :token_not_yet_valid,
+             :service_url_mismatch
+           ] do
+    WebhookResponse.error(401, %{error: to_string(reason)})
+  end
+
+  def format_webhook_response({:error, %Jido.Chat.Errors.Contract{code: code}}, _opts) do
+    WebhookResponse.error(400, %{error: to_string(code)})
+  end
+
+  def format_webhook_response(_, _opts) do
+    WebhookResponse.error(400, %{error: "rejected"})
+  end
+
+  @doc "Formats a private Teams options response from a validated native operation result."
+  @spec format_options_load_response({:ok, map() | Jido.Signal.t()} | {:error, map()}) ::
+          WebhookResponse.t()
+  def format_options_load_response({:ok, %Jido.Signal{data: %{"result" => result}}}) do
+    format_options_load_response({:ok, result})
+  end
+
+  def format_options_load_response({:ok, result}) when is_map(result) do
+    options = value(result, :options) || []
+
+    WebhookResponse.new(%{
+      status: 200,
+      headers: %{"content-type" => "application/json"},
+      body: %{
+        "type" => "application/vnd.microsoft.search.searchResponse",
+        "value" => %{
+          "results" =>
+            Enum.map(options, fn option ->
+              %{"title" => value(option, :label), "value" => value(option, :value)}
+            end)
+        }
+      }
+    })
+  end
+
+  def format_options_load_response({:error, %{code: code} = error}) do
+    WebhookResponse.new(%{
+      status:
+        if error[:kind] == :timeout do
+          504
+        else
+          400
+        end,
+      headers: %{"content-type" => "application/json"},
+      body: %{"error" => %{"code" => code, "retryable" => error.retryable}}
+    })
+  end
+
+  defp send_activity(reference, activity, opts) do
+    case opts[:reply_to_id] || opts[:external_reply_to_id] do
+      nil ->
+        transport(opts).send_activity(reference, activity, opts)
+
+      reply_to_id ->
+        transport(opts).reply_to_activity(reference, stringify(reply_to_id), activity, opts)
+    end
+  end
+
+  defp transport(opts) do
+    Keyword.get(opts, :transport, ReqClient)
+  end
+
+  defp message_activity(text, opts) do
+    %{
+      "type" => "message",
+      "text" => text,
+      "textFormat" => Keyword.get(opts, :text_format, "markdown")
+    }
+    |> maybe_put("entities", opts[:entities])
+    |> maybe_put("channelData", opts[:channel_data])
+  end
+
+  defp card_activity(card, payload, opts) do
+    %{
+      "type" => "message",
+      "text" => PostPayload.display_text(payload) || "",
+      "attachments" => [%{"contentType" => @card_content_type, "content" => card}]
+    }
+    |> maybe_put("channelData", opts[:channel_data])
+  end
+
+  defp render_card(nil) do
+    {:error, :missing_card}
+  end
+
+  defp render_card(card) do
+    {:ok, CardRenderer.render(card)}
+  rescue
+    _exception -> {:error, :invalid_card}
+  end
+
+  defp response(reference, external_room_id, result, status) do
+    message_id = value(result, :id) || value(result, :activityId)
+
+    %{
+      external_message_id: message_id,
+      external_room_id: external_room_id,
+      channel_type: :teams,
+      status: status,
+      raw: result,
+      metadata: %{
+        conversation_id: reference.conversation_id,
+        conversation_ref: ConversationRef.encode(reference)
+      }
+    }
+  end
+
+  defp put_result_id(result, message_id) when is_map(result) do
+    if value(result, :id) || value(result, :activityId) do
+      result
+    else
+      Map.put(result, "id", stringify(message_id))
+    end
+  end
+
+  defp conversation_reference(payload) do
+    conversation = value(payload, :conversation) || %{}
+    channel_data = value(payload, :channelData) || %{}
+    tenant = value(channel_data, :tenant) || %{}
+    team = value(channel_data, :team) || %{}
+    channel = value(channel_data, :channel) || %{}
+    recipient = value(payload, :recipient) || %{}
+    from = value(payload, :from) || %{}
+
+    ConversationRef.cast(%{
+      conversation_id: value(conversation, :id),
+      service_url: value(payload, :serviceUrl),
+      tenant_id: value(tenant, :id),
+      scope: activity_scope(conversation, team, channel),
+      team_id: value(team, :id),
+      channel_id: value(channel, :id),
+      bot_id: value(recipient, :id),
+      user_id: value(from, :aadObjectId) || value(from, :id)
+    })
+  end
+
+  defp activity_scope(_conversation, team, channel)
+       when map_size(team) > 0 or map_size(channel) > 0 do
+    :channel
+  end
+
+  defp activity_scope(conversation, _team, _channel) do
+    case value(conversation, :conversationType) do
+      "personal" -> :personal
+      "groupChat" -> :group_chat
+      "channel" -> :channel
+      _other -> nil
+    end
+  end
+
+  defp external_room_id(%ConversationRef{scope: :channel} = reference) do
+    reference.channel_id || reference.team_id || reference.conversation_id
+  end
+
+  defp external_room_id(%ConversationRef{} = reference) do
+    reference.conversation_id
+  end
+
+  defp chat_type(:personal) do
+    :private
+  end
+
+  defp chat_type(:group_chat) do
+    :group
+  end
+
+  defp chat_type(:channel) do
+    :channel
+  end
+
+  defp chat_type(_scope) do
+    :private
+  end
+
+  defp chat_title(payload) do
+    channel_data = value(payload, :channelData) || %{}
+    channel = value(channel_data, :channel) || %{}
+    team = value(channel_data, :team) || %{}
+    value(channel, :name) || value(team, :name)
+  end
+
+  defp parse_mentions(payload) do
+    recipient_id = value(value(payload, :recipient) || %{}, :id)
+
+    payload
+    |> value(:entities)
+    |> List.wrap()
+    |> Enum.flat_map(fn entity ->
+      if value(entity, :type) == "mention" do
+        mentioned = value(entity, :mentioned) || %{}
+        user_id = stringify(value(mentioned, :id))
+
+        [
+          %{
+            user_id: user_id,
+            username: value(mentioned, :name),
+            display_name: value(mentioned, :name),
+            mention_text: value(entity, :text),
+            is_self: not is_nil(user_id) and user_id == stringify(recipient_id),
+            metadata: %{}
+          }
+        ]
+      else
+        []
+      end
+    end)
+  end
+
+  defp clean_text(text, mentions) when is_binary(text) do
+    mentions
+    |> Enum.filter(& &1.is_self)
+    |> Enum.reduce(text, fn mention, acc ->
+      case mention.mention_text do
+        mention_text when is_binary(mention_text) -> String.replace(acc, mention_text, "")
+        _other -> acc
+      end
+    end)
+    |> String.trim()
+  end
+
+  defp clean_text(_text, _mentions) do
+    nil
+  end
+
+  defp extract_media(payload) do
+    payload
+    |> value(:attachments)
+    |> List.wrap()
+    |> Enum.flat_map(fn attachment ->
+      content_type = attachment |> value(:contentType) |> normalize_media_type()
+      content_url = attachment |> value(:contentUrl) |> blank_to_nil()
+      filename = attachment |> value(:name) |> blank_to_nil()
+
+      if card_content_type?(content_type) or is_nil(content_url) do
+        []
+      else
+        [
+          %{
+            kind: attachment_kind(content_type, filename, content_url),
+            url: content_url,
+            media_type: content_type,
+            filename: filename,
+            metadata: %{content: value(attachment, :content)}
+          }
+        ]
+      end
+    end)
+  end
+
+  defp card_content_type?(nil) do
+    false
+  end
+
+  defp card_content_type?(content_type) do
+    canonical_media_type(content_type) == @card_content_type
+  end
+
+  defp attachment_kind(media_type, filename, url) do
+    media_kind_from_type(media_type) || media_kind_from_reference(filename) ||
+      media_kind_from_reference(url) || :file
+  end
+
+  defp media_kind_from_type(media_type) when is_binary(media_type) do
+    case canonical_media_type(media_type) do
+      "image/" <> _rest -> :image
+      "audio/" <> _rest -> :audio
+      "video/" <> _rest -> :video
+      _other -> :file
+    end
+  end
+
+  defp media_kind_from_type(_media_type) do
+    nil
+  end
+
+  defp media_kind_from_reference(reference) when is_binary(reference) do
+    reference
+    |> URI.parse()
+    |> Map.get(:path)
+    |> case do
+      path when is_binary(path) -> path |> Path.extname() |> String.downcase()
+      _other -> ""
+    end
+    |> then(&Map.get(@media_kind_extensions, &1))
+  end
+
+  defp media_kind_from_reference(_reference) do
+    nil
+  end
+
+  defp normalize_media_type(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    if Regex.match?(@media_type_pattern, canonical_media_type(trimmed)) do
+      trimmed
+    else
+      nil
+    end
+  end
+
+  defp normalize_media_type(_value) do
+    nil
+  end
+
+  defp canonical_media_type(value) do
+    value |> String.split(";", parts: 2) |> hd() |> String.trim() |> String.downcase()
+  end
+
+  defp blank_to_nil(value) when is_binary(value) do
+    if String.trim(value) == "" do
+      nil
+    else
+      value
+    end
+  end
+
+  defp blank_to_nil(_value) do
+    nil
+  end
+
+  defp fetch_options_loader(opts) do
+    case opts[:options_loader] do
+      loader when is_function(loader, 1) or is_function(loader, 2) ->
+        {:ok, loader}
+
+      {module, function, args} = loader
+      when is_atom(module) and is_atom(function) and is_list(args) ->
+        {:ok, loader}
+
+      nil ->
+        {:error, options_error("options_loader_unavailable", "No options loader is configured")}
+
+      _other ->
+        {:error, options_error("invalid_options_loader", "The options loader is invalid")}
+    end
+  end
+
+  defp call_options_loader(loader, event, opts, timeout_ms) do
+    caller = self()
+    reply_ref = make_ref()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        send(caller, {reply_ref, safely_invoke_options_loader(loader, event, opts)})
+      end)
+
+    receive do
+      {^reply_ref, {:ok, result}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:ok, result}
+
+      {^reply_ref, {:error, reason}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, options_loader_error(reason)}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:error, options_loader_error(reason)}
+    after
+      timeout_ms ->
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok
+        end
+
+        receive do
+          {^reply_ref, _late_result} -> :ok
+        after
+          0 -> :ok
+        end
+
+        {:error, options_timeout(timeout_ms)}
+    end
+  end
+
+  defp invoke_options_loader(loader, event, opts) when is_function(loader, 2) do
+    loader.(event, opts)
+  end
+
+  defp invoke_options_loader(loader, event, _opts) when is_function(loader, 1) do
+    loader.(event)
+  end
+
+  defp invoke_options_loader({module, function, args}, event, opts) do
+    apply(module, function, [event, opts | args])
+  end
+
+  defp safely_invoke_options_loader(loader, event, opts) do
+    {:ok, invoke_options_loader(loader, event, opts)}
+  rescue
+    exception -> {:error, {exception, __STACKTRACE__}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp normalize_options_result({:ok, result}, _timeout_ms) when is_map(result) do
+    options = value(result, :options) || []
+    groups = value(result, :option_groups) || []
+
+    {:ok,
+     %{options: Enum.map(options, &Jido.Chat.OptionsLoadOption.new/1), option_groups: groups}}
+  rescue
+    _ -> {:error, options_loader_error(:invalid_result)}
+  end
+
+  defp normalize_options_result({:error, :timeout}, timeout_ms) do
+    {:error, options_timeout(timeout_ms)}
+  end
+
+  defp normalize_options_result({:error, reason}, _timeout_ms) do
+    {:error, options_loader_error(reason)}
+  end
+
+  defp normalize_options_result(_, _timeout_ms) do
+    {:error, options_error("invalid_options_loader_result", "Invalid loader result")}
+  end
+
+  defp validate_options_result(%{option_groups: [_ | _]}, _event) do
+    {:error,
+     options_error(
+       "teams_option_groups_unsupported",
+       "Teams dynamic-search responses do not support option groups"
+     )}
+  end
+
+  defp validate_options_result(%{options: options}, event) do
+    max_choices = CardRenderer.max_choices()
+    limit = min(event.data["limit"] || max_choices, max_choices)
+    option_count = length(options)
+
+    if option_count <= limit do
+      :ok
+    else
+      {:error,
+       options_error(
+         "teams_option_limit",
+         "Teams dynamic-search responses support at most #{limit} options",
+         %{actual: option_count, limit: limit}
+       )}
+    end
+  end
+
+  defp options_timeout(timeout_ms) do
+    %{
+      kind: :timeout,
+      code: "options_load_timeout",
+      class: :recoverable,
+      retryable: true,
+      timeout_ms: timeout_ms
+    }
+  end
+
+  defp options_loader_error(_reason) do
+    options_error("options_loader_error", "The options loader failed", %{})
+  end
+
+  defp options_error(code, message, metadata \\ %{}) do
+    %{kind: :provider, code: code, message: message, retryable: false, metadata: metadata}
+  end
+
+  defp action_value(value) when is_binary(value) do
+    value
+  end
+
+  defp action_value(value) when is_map(value) do
+    case value(value, :value) do
+      nested when is_binary(nested) -> nested
+      _other -> Jason.encode!(normalize_struct(value))
+    end
+  end
+
+  defp action_value(_value) do
+    nil
+  end
+
+  defp positive_integer(value) when is_integer(value) and value > 0 do
+    value
+  end
+
+  defp positive_integer(_value) do
+    nil
+  end
+
+  defp value(map, key) when is_map(map) and is_atom(key) do
+    Map.get(map, key) || Map.get(map, Atom.to_string(key))
+  end
+
+  defp value(_map, _key) do
+    nil
+  end
+
+  defp maybe_put(map, _key, nil) do
+    map
+  end
+
+  defp maybe_put(map, key, value) do
+    Map.put(map, key, value)
+  end
+
+  defp stringify(nil) do
+    nil
+  end
+
+  defp stringify(value) when is_binary(value) do
+    value
+  end
+
+  defp stringify(value) do
+    to_string(value)
+  end
+
+  defp normalize_struct(%_{} = struct) do
+    struct |> Map.from_struct() |> normalize_struct()
+  end
+
+  defp normalize_struct(map) when is_map(map) do
+    Map.new(map, fn {key, value} -> {key, normalize_struct(value)} end)
+  end
+
+  defp normalize_struct(list) when is_list(list) do
+    Enum.map(list, &normalize_struct/1)
+  end
+
+  defp normalize_struct(value) do
+    value
+  end
+
+  @impl true
+  def signal_protocol do
+    1
+  end
+
+  @impl true
+  def normalize_event(binding, input) do
+    tracker = {__MODULE__, make_ref()}
+    Process.put(tracker, [])
+
+    result =
+      try do
+        with {:ok, items} <- native_inputs(binding, input) do
+          delivery =
+            "teams:delivery:" <> native_digest({binding.id, Enum.map(items, &elem(&1, 2))})
+
+          base = %{binding: binding, delivery: delivery, tracker: tracker}
+
+          with {:ok, facts} <- native_items(base, items) do
+            Jido.Chat.Delivery.new(binding, delivery, facts)
+          end
+        end
+      rescue
+        _ -> Jido.Chat.Signal.Policy.error(:invalid_delivery)
+      catch
+        _, _ -> Jido.Chat.Signal.Policy.error(:invalid_delivery)
+      end
+
+    if match?({:error, _}, result) do
+      Enum.each(Process.get(tracker, []), &Jido.Chat.cancel_resource(binding, &1))
+    end
+
+    Process.delete(tracker)
+    result
+  end
+
+  defp native_items(base, items) do
+    items
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {{kind, payload, key}, index}, {:ok, acc} ->
+      context = Map.merge(base, %{item: "teams:item:" <> key, index: index})
+      existing = Process.get(context.tracker)
+
+      result =
+        try do
+          native_map(context, kind, payload)
+        rescue
+          _ -> {:error, :invalid_item}
+        catch
+          _, _ -> {:error, :invalid_item}
+        end
+
+      case result do
+        {:ok, facts} ->
+          facts = List.wrap(facts)
+
+          if Enum.all?(facts, &(&1.type == "jido.chat.normalization.failed")) do
+            Enum.each(
+              Process.get(context.tracker) -- existing,
+              &Jido.Chat.cancel_resource(base.binding, &1)
+            )
+          end
+
+          {:cont, {:ok, acc ++ facts}}
+
+        {:error, %Jido.Chat.Errors.Contract{code: code}} = error
+        when code in [
+               :signal_too_large,
+               :delivery_too_large,
+               :too_many_signals,
+               :too_many_failures
+             ] ->
+          {:halt, error}
+
+        _ ->
+          Enum.each(
+            Process.get(context.tracker) -- existing,
+            &Jido.Chat.cancel_resource(base.binding, &1)
+          )
+
+          case native_failure(context, "invalid_item", kind, nil) do
+            {:ok, fact} -> {:cont, {:ok, acc ++ [fact]}}
+            error -> {:halt, error}
+          end
+      end
+    end)
+  end
+
+  defp native_fact(context, definition, data, ordinal \\ "0") do
+    room = data["room_id"]
+
+    data =
+      data
+      |> Map.merge(%{
+        "item_id" => context.item <> ":" <> definition.type() <> ":" <> ordinal,
+        "delivery_id" => context.delivery
+      })
+      |> Map.reject(fn {key, value} ->
+        is_nil(value) and key not in ["text", "previous", "current", "actor_id"]
+      end)
+
+    subject =
+      if is_binary(room) and room != "" do
+        Jido.Chat.Signal.Identity.conversation_subject(context.binding.id, room)
+      end
+
+    definition.new(data, source: context.binding.source, subject: subject)
+  end
+
+  defp native_failure(context, code, kind, room) do
+    native_fact(context, Jido.Chat.Signal.NormalizationFailed, %{
+      "code" => code,
+      "provider_kind" => kind,
+      "item_index" => context.index,
+      "room_id" => room
+    })
+  end
+
+  defp native_media(context, media) do
+    Enum.reduce_while(media, {:ok, []}, fn value, {:ok, acc} ->
+      with {:ok, ref} <- Jido.Chat.put_resource(context.binding, "media", value) do
+        Process.put(context.tracker, [ref | Process.get(context.tracker)])
+
+        item =
+          %{"kind" => to_string(value.kind), "resource_ref" => ref}
+          |> native_optional("name", value.filename)
+          |> native_optional("media_type", value.media_type)
+
+        {:cont, {:ok, acc ++ [item]}}
+      else
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp native_get(map, key) when is_map(map) do
+    atom =
+      try do
+        String.to_existing_atom(key)
+      rescue
+        ArgumentError -> nil
+      end
+
+    if Map.has_key?(map, key) do
+      Map.get(map, key)
+    else
+      Map.get(map, atom)
+    end
+  end
+
+  defp native_get(_, _) do
+    nil
+  end
+
+  defp native_id(map, key) do
+    native_identifier(native_get(map, key))
+  end
+
+  defp native_identifier(value) when is_binary(value) and value != "" do
+    value
+  end
+
+  defp native_identifier(value) when is_integer(value) do
+    to_string(value)
+  end
+
+  defp native_identifier(_) do
+    nil
+  end
+
+  defp native_optional(map, _, nil) do
+    map
+  end
+
+  defp native_optional(map, key, value) do
+    Map.put(map, key, value)
+  end
+
+  defp native_time(%DateTime{} = value) do
+    DateTime.to_iso8601(value)
+  end
+
+  defp native_time(value) when is_binary(value) do
+    value
+  end
+
+  defp native_time(_) do
+    nil
+  end
+
+  defp native_canonical(%_{} = value) do
+    value |> Map.from_struct() |> native_canonical()
+  end
+
+  defp native_canonical(value) when is_map(value) do
+    value |> Enum.map(fn {k, v} -> {to_string(k), native_canonical(v)} end) |> Enum.sort()
+  end
+
+  defp native_canonical(value) when is_list(value) do
+    Enum.map(value, &native_canonical/1)
+  end
+
+  defp native_canonical(value) do
+    value
+  end
+
+  defp native_digest(value) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(native_canonical(value), [:deterministic]))
+    |> Base.url_encode64(padding: false)
+  end
+
+  @impl true
+  def configure_binding(opts) do
+    opts =
+      opts
+      |> Keyword.put_new(:transport, ReqClient)
+      |> Keyword.put_new(:verifier, JwtVerifier)
+      |> Keyword.put_new(:reference_store, :ets.new(:teams_references, [:set, :public]))
+
+    opts =
+      Enum.reduce([:app_id, :app_password], opts, fn key, acc ->
+        value =
+          case Jido.Chat.Teams.Auth.credential(opts, key) do
+            {:ok, value} -> value
+            _ -> ""
+          end
+
+        Keyword.put(acc, key, value)
+      end)
+
+    {:ok, opts}
+  end
+
+  defp delivery_reference(room, opts) do
+    case opts[:reference_store] && :ets.lookup(opts[:reference_store], room) do
+      [{^room, binding, ref}] ->
+        case Jido.Chat.resolve_resource(binding, ref) do
+          {:ok, %{reference: reference}} -> {:ok, reference}
+          error -> error
+        end
+
+      _ ->
+        ConversationRef.cast(room, opts)
+    end
+  end
+
+  defp native_inputs(binding, %WebhookRequest{} = request) do
+    with :ok <- verify_webhook(request, binding.options) do
+      payload = request.payload
+      key = native_id(payload, "id") || native_digest(payload)
+      room = native_id(native_get(payload, "conversation"), "id")
+
+      {:ok,
+       [
+         {native_get(payload, "type") || "unknown", {:verified, payload},
+          native_digest({room, key})}
+       ]}
+    end
+  end
+
+  defp native_inputs(binding, items) when is_list(items) do
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+      case native_inputs(binding, item) do
+        {:ok, values} -> {:cont, {:ok, acc ++ values}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp native_inputs(_binding, payload) when is_map(payload) do
+    key = native_id(payload, "id") || native_digest(payload)
+
+    {:ok,
+     [
+       {native_get(payload, "type") || "unknown", payload,
+        native_digest({native_id(native_get(payload, "conversation"), "id"), key})}
+     ]}
+  end
+
+  defp native_inputs(_, _) do
+    {:ok, [{"invalid", nil, "invalid"}]}
+  end
+
+  defp native_map(context, kind, {:verified, payload}) do
+    with {:ok, facts} <- native_activity(context, kind, payload) do
+      with false <- Enum.all?(List.wrap(facts), &(&1.type == "jido.chat.normalization.failed")),
+           {:ok, reference} <- conversation_reference(payload),
+           {:ok, ref} <-
+             Jido.Chat.put_resource(context.binding, "result", %{
+               reference: reference,
+               activity: payload
+             }) do
+        Process.put(context.tracker, [ref | Process.get(context.tracker)])
+
+        :ets.insert(
+          context.binding.options[:reference_store],
+          {external_room_id(reference), context.binding, ref}
+        )
+      end
+
+      {:ok, facts}
+    end
+  end
+
+  defp native_map(context, kind, payload) do
+    native_activity(context, kind, payload)
+  end
+
+  defp native_room(payload) do
+    data = native_get(payload, "channelData") || %{}
+
+    native_id(native_get(data, "channel"), "id") ||
+      native_id(native_get(payload, "conversation"), "id")
+  end
+
+  defp native_actor(payload) do
+    native_id(native_get(payload, "from"), "aadObjectId") ||
+      native_id(native_get(payload, "from"), "id")
+  end
+
+  defp native_activity(context, type, payload) when type in ["message", "messageUpdate"] do
+    with {:ok, incoming} <- provider_message(payload),
+         {:ok, media} <- native_media(context, Enum.map(incoming.media, &Jido.Chat.Media.new/1)) do
+      mentions = incoming.mentions
+
+      sender =
+        if native_identifier(incoming.external_user_id),
+          do:
+            %{"id" => native_identifier(incoming.external_user_id)}
+            |> native_optional("display_name", incoming.display_name)
+
+      definition =
+        if type == "message" do
+          Jido.Chat.Signal.MessageReceived
+        else
+          Jido.Chat.Signal.MessageUpdated
+        end
+
+      data = %{
+        "room_id" => incoming.external_room_id,
+        "message_id" => incoming.external_message_id,
+        "sender" => sender,
+        "text" => incoming.text,
+        "thread_id" => incoming.external_thread_id,
+        "media" => media,
+        "timestamp" => native_time(incoming.timestamp)
+      }
+
+      data =
+        if type == "message" do
+          Map.merge(data, %{
+            "conversation_name" => incoming.chat_title,
+            "conversation_kind" =>
+              case incoming.chat_type do
+                :private -> "direct"
+                :group -> "group"
+                _ -> "channel"
+              end,
+            "mentioned" => incoming.was_mentioned,
+            "mentions" => Enum.map(mentions, & &1.user_id),
+            "mention_details" =>
+              Enum.map(mentions, fn m ->
+                %{"id" => m.user_id} |> native_optional("username", m.username)
+              end),
+            "reply_to_id" => incoming.external_reply_to_id
+          })
+        else
+          data
+        end
+
+      native_fact(context, definition, data)
+    end
+  end
+
+  defp native_activity(context, "messageDelete", payload) do
+    native_fact(context, Jido.Chat.Signal.MessageDeleted, %{
+      "room_id" => native_room(payload),
+      "message_id" => native_id(payload, "id"),
+      "actor_id" => native_actor(payload)
+    })
+  end
+
+  defp native_activity(context, "messageReaction", payload) do
+    groups = [
+      {"reactionsAdded", Jido.Chat.Signal.ReactionAdded},
+      {"reactionsRemoved", Jido.Chat.Signal.ReactionRemoved}
+    ]
+
+    Enum.reduce_while(groups, {:ok, []}, fn {key, definition}, {:ok, acc} ->
+      result =
+        native_many(
+          %{context | item: context.item <> key},
+          native_get(payload, key) || [],
+          fn reaction, index ->
+            native_fact(
+              context,
+              definition,
+              %{
+                "room_id" => native_room(payload),
+                "message_id" => native_id(payload, "replyToId") || native_id(payload, "id"),
+                "actor_id" => native_actor(payload),
+                "reaction" => native_get(reaction, "type")
+              },
+              key <> to_string(index)
+            )
+          end
+        )
+
+      case result do
+        {:ok, facts} -> {:cont, {:ok, acc ++ facts}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp native_activity(context, "conversationUpdate", payload) do
+    groups = [
+      {"membersAdded", "joined", "member", true, "explicit_join"},
+      {"membersRemoved", "left", "left", false, "explicit_leave"}
+    ]
+
+    Enum.reduce_while(groups, {:ok, []}, fn {key, transition, status, present, evidence},
+                                            {:ok, acc} ->
+      result =
+        native_many(
+          %{context | item: context.item <> key},
+          native_get(payload, key) || [],
+          fn member, index ->
+            native_member(
+              context,
+              payload,
+              member,
+              transition,
+              status,
+              present,
+              evidence,
+              key <> to_string(index)
+            )
+          end
+        )
+
+      case result do
+        {:ok, facts} -> {:cont, {:ok, acc ++ facts}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp native_activity(context, "installationUpdate", payload) do
+    case native_get(payload, "action") do
+      "add" ->
+        native_member(
+          context,
+          payload,
+          native_get(payload, "recipient"),
+          "joined",
+          "member",
+          true,
+          "explicit_join",
+          "install"
+        )
+
+      "remove" ->
+        native_member(
+          context,
+          payload,
+          native_get(payload, "recipient"),
+          "left",
+          "left",
+          false,
+          "explicit_leave",
+          "install"
+        )
+
+      _ ->
+        native_failure(context, "unsupported_item", "installationUpdate", native_room(payload))
+    end
+  end
+
+  defp native_activity(context, "invoke", payload) do
+    request = native_get(payload, "value") || %{}
+
+    base = %{
+      "room_id" => native_room(payload),
+      "interaction_id" => native_id(payload, "id"),
+      "actor_id" => native_actor(payload)
+    }
+
+    case native_get(payload, "name") do
+      "application/search" ->
+        native_fact(
+          context,
+          Jido.Chat.Signal.OptionsRequested,
+          Map.merge(base, %{
+            "action_id" => native_get(request, "dataset") || native_get(request, "action_id"),
+            "query" => native_get(request, "queryText") || "",
+            "limit" => positive_integer(native_get(native_get(request, "queryOptions"), "top"))
+          })
+        )
+
+      name ->
+        action = native_get(request, "action") || request
+
+        native_fact(
+          context,
+          Jido.Chat.Signal.ActionReceived,
+          Map.merge(base, %{
+            "action_id" => native_get(action, "verb") || native_get(action, "action_id") || name,
+            "value" => action_value(action),
+            "message_id" => native_id(payload, "replyToId") || native_id(payload, "id")
+          })
+        )
+    end
+  end
+
+  defp native_activity(_context, type, _payload) when type in ["typing", "event"] do
+    {:ok, []}
+  end
+
+  defp native_activity(context, kind, _payload) do
+    native_failure(context, "unsupported_item", kind, nil)
+  end
+
+  defp native_member(context, payload, member, transition, status, present, evidence, ordinal) do
+    id = native_id(member, "aadObjectId") || native_id(member, "id")
+    bot = native_id(native_get(payload, "recipient"), "id") || context.binding.options[:bot_id]
+
+    native_fact(
+      context,
+      Jido.Chat.Signal.MembershipChanged,
+      %{
+        "room_id" => native_room(payload),
+        "participant_id" => id,
+        "actor_id" => native_actor(payload),
+        "bot_self" => id != nil and id == bot,
+        "transition" => transition,
+        "evidence" => evidence,
+        "previous" => nil,
+        "current" => %{"status" => status, "is_member" => present}
+      },
+      ordinal
+    )
+  end
+
+  defp native_many(context, items, fun) do
+    items
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {item, index}, {:ok, acc} ->
+      case fun.(item, index) do
+        {:ok, fact} ->
+          {:cont, {:ok, acc ++ [fact]}}
+
+        {:error, %Jido.Chat.Errors.Contract{code: code}} = error
+        when code in [
+               :signal_too_large,
+               :delivery_too_large,
+               :too_many_signals,
+               :too_many_failures
+             ] ->
+          {:halt, error}
+
+        _ ->
+          {:ok, failure} =
+            native_failure(
+              %{context | index: index, item: context.item <> to_string(index)},
+              "invalid_item",
+              "activity_item",
+              nil
+            )
+
+          {:cont, {:ok, acc ++ [failure]}}
+      end
+    end)
+  end
+end

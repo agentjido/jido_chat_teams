@@ -2,12 +2,7 @@ defmodule Jido.Chat.Teams.AdapterTest do
   use ExUnit.Case, async: true
 
   alias Jido.Chat.{
-    ActionEvent,
-    OptionsLoadError,
-    OptionsLoadEvent,
-    OptionsLoadResult,
     PostPayload,
-    ReactionEvent,
     WebhookRequest
   }
 
@@ -55,19 +50,22 @@ defmodule Jido.Chat.Teams.AdapterTest do
   end
 
   test "normalizes a channel message and preserves a delivery reference" do
-    assert {:ok, incoming} = Jido.Chat.Teams.Adapter.transform_incoming(channel_activity())
+    incoming = normalize(channel_activity())
 
-    assert incoming.external_room_id == "channel-1"
-    assert incoming.external_user_id == "aad-user-1"
-    assert incoming.external_message_id == "activity-1"
-    assert incoming.external_thread_id == "19:thread@thread.tacv2"
-    assert incoming.chat_type == :channel
-    assert incoming.chat_title == "General"
-    assert incoming.text == "hello from Teams"
-    assert incoming.was_mentioned
-    assert [%{user_id: "28:bot", is_self: true}] = incoming.mentions
+    assert incoming.data["room_id"] == "channel-1"
+    assert incoming.data["sender"]["id"] == "aad-user-1"
+    assert incoming.data["message_id"] == "activity-1"
+    assert incoming.data["thread_id"] == "19:thread@thread.tacv2"
+    assert incoming.data["conversation_kind"] == "channel"
+    assert incoming.data["conversation_name"] == "General"
+    assert incoming.data["text"] == "hello from Teams"
+    assert incoming.data["mentioned"]
+    assert ["28:bot"] = incoming.data["mentions"]
 
-    assert {:ok, reference} = ConversationRef.decode(incoming.delivery_external_room_id)
+    binding = Process.get(:teams_binding)
+    assert [{_, ^binding, ref}] = :ets.lookup(binding.options[:reference_store], "channel-1")
+    assert {:ok, %{reference: reference}} = Jido.Chat.resolve_resource(binding, ref)
+    refute Jason.encode!(Jido.Signal.to_map(incoming)) =~ "smba.trafficmanager.net"
     assert reference.conversation_id == "19:thread@thread.tacv2"
     assert reference.service_url == "https://smba.trafficmanager.net/amer"
     assert reference.tenant_id == "tenant-1"
@@ -82,11 +80,11 @@ defmodule Jido.Chat.Teams.AdapterTest do
       |> Map.put("conversation", %{"id" => "personal-1", "conversationType" => "personal"})
       |> Map.put("channelData", %{"tenant" => %{"id" => "tenant-1"}})
 
-    assert {:ok, incoming} = Jido.Chat.Teams.Adapter.transform_incoming(activity)
-    assert incoming.external_room_id == "personal-1"
-    assert incoming.external_thread_id == nil
-    assert incoming.chat_type == :private
-    assert incoming.channel_meta.is_dm
+    incoming = normalize(activity)
+    assert incoming.data["room_id"] == "personal-1"
+    assert incoming.data["thread_id"] == nil
+    assert incoming.data["conversation_kind"] == "direct"
+    assert incoming.data["conversation_kind"] == "direct"
   end
 
   test "normalizes attachments when contentType is missing" do
@@ -121,8 +119,17 @@ defmodule Jido.Chat.Teams.AdapterTest do
         }
       ])
 
-    assert {:ok, incoming} = Jido.Chat.Teams.Adapter.transform_incoming(activity)
-    assert [explicit, fallback, unknown, signed_url, misleading] = incoming.media
+    incoming = normalize(activity)
+
+    media =
+      Enum.map(incoming.data["media"], fn item ->
+        assert {:ok, media} =
+                 Jido.Chat.resolve_resource(Process.get(:teams_binding), item["resource_ref"])
+
+        media
+      end)
+
+    assert [explicit, fallback, unknown, signed_url, misleading] = media
 
     assert explicit.kind == :image
     assert explicit.media_type == "image/png"
@@ -143,8 +150,13 @@ defmodule Jido.Chat.Teams.AdapterTest do
   end
 
   test "rejects unsupported activity types" do
-    assert {:error, {:unsupported_activity_type, "conversationUpdate"}} =
-             Jido.Chat.Teams.Adapter.transform_incoming(%{"type" => "conversationUpdate"})
+    binding = native_binding()
+
+    assert {:ok, %{signals: []}} =
+             Jido.Chat.normalize_event(binding, %{"type" => "conversationUpdate"})
+
+    assert {:ok, %{signals: [%{type: "jido.chat.normalization.failed"}]}} =
+             Jido.Chat.normalize_event(binding, %{"type" => "unknown"})
   end
 
   test "sends, replies, edits, deletes, and starts typing" do
@@ -232,10 +244,10 @@ defmodule Jido.Chat.Teams.AdapterTest do
         }
       })
 
-    assert {:ok, reaction_envelope} = Jido.Chat.Teams.Adapter.parse_event(reaction_request)
+    reaction = normalize(reaction_request.payload, false)
 
-    assert %ReactionEvent{emoji: "like", added: true, message_id: "activity-1"} =
-             reaction_envelope.payload
+    assert reaction.type == "jido.chat.reaction.added"
+    assert reaction.data["reaction"] == "like" and reaction.data["message_id"] == "activity-1"
 
     invoke_request =
       WebhookRequest.new(%{
@@ -250,8 +262,9 @@ defmodule Jido.Chat.Teams.AdapterTest do
         }
       })
 
-    assert {:ok, action_envelope} = Jido.Chat.Teams.Adapter.parse_event(invoke_request)
-    assert %ActionEvent{action_id: "approve", value: "42"} = action_envelope.payload
+    action = normalize(invoke_request.payload, false)
+    assert action.type == "jido.chat.action.received"
+    assert action.data["action_id"] == "approve" and action.data["value"] == "42"
   end
 
   test "parses Teams dynamic-search invokes into normalized options-load events" do
@@ -275,36 +288,44 @@ defmodule Jido.Chat.Teams.AdapterTest do
         }
       })
 
-    assert {:ok, envelope} = Jido.Chat.Teams.Adapter.parse_event(request)
-    assert envelope.event_type == :options_load
+    request = %{request | payload: Map.put(request.payload, "serviceUrl", "https://fixture.test")}
+    binding = native_binding()
+    assert {:ok, %{signals: [fact]}} = Jido.Chat.normalize_event(binding, request)
+    assert fact.type == "jido.chat.options.requested"
 
-    assert %OptionsLoadEvent{
-             action_id: "assignee",
-             query: "ad",
-             limit: 12,
-             timeout_ms: 750,
-             channel_id: "conversation-1",
-             message_id: "activity-1"
-           } = envelope.payload
+    assert Map.take(fact.data, ["action_id", "query", "limit", "room_id", "interaction_id"]) ==
+             %{
+               "action_id" => "assignee",
+               "query" => "ad",
+               "limit" => 12,
+               "room_id" => "conversation-1",
+               "interaction_id" => "invoke-search-1"
+             }
 
-    assert envelope.payload.metadata == %{associated_inputs: %{"team" => "core"}, skip: 3}
-
+    assert [{_, ^binding, ref}] = :ets.lookup(binding.options[:reference_store], "conversation-1")
+    assert {:ok, %{activity: private}} = Jido.Chat.resolve_resource(binding, ref)
+    assert private["value"]["data"] == %{"team" => "core"}
+    assert private["value"]["queryOptions"]["skip"] == 3
+    assert private["value"]["timeoutMs"] == 750
+    refute Map.has_key?(fact.data, "timeout_ms")
     malformed = put_in(request.payload["value"], %{"queryText" => "ad"})
-    assert {:error, :missing_options_dataset} = Jido.Chat.Teams.Adapter.parse_event(malformed)
+
+    assert {:ok, %{signals: [%{type: "jido.chat.normalization.failed"}]}} =
+             Jido.Chat.normalize_event(binding, malformed.payload)
   end
 
   test "loads and formats dynamic options with Teams limits" do
-    event = OptionsLoadEvent.new(%{action_id: "assignee", query: "ad", timeout_ms: 500})
+    event = options_query(%{action_id: "assignee", query: "ad", timeout_ms: 500})
 
     loader = fn ^event, _opts ->
       {:ok, %{options: [%{label: "Ada", value: "user:ada"}]}}
     end
 
-    assert {:ok, %OptionsLoadResult{} = result} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: loader)
+    assert {:ok, %{options: _} = result} =
+             load_options(event, options_loader: loader)
 
-    assert {:ok, %OptionsLoadResult{}} =
-             Jido.Chat.Adapter.load_options(Jido.Chat.Teams.Adapter, event,
+    assert {:ok, %{type: "jido.chat.operation.completed"}} =
+             execute_options(event,
                options_loader: loader
              )
 
@@ -325,15 +346,15 @@ defmodule Jido.Chat.Teams.AdapterTest do
        }}
     end
 
-    assert {:error, %OptionsLoadError{code: "teams_option_limit", retryable: false}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: oversized_loader)
+    assert {:error, %{code: "teams_option_limit", retryable: false}} =
+             load_options(event, options_loader: oversized_loader)
   end
 
   test "normalizes missing loaders, groups, loader errors, and timeouts" do
-    event = OptionsLoadEvent.new(%{action_id: "assignee", timeout_ms: 20})
+    event = options_query(%{action_id: "assignee", timeout_ms: 20})
 
-    assert {:error, %OptionsLoadError{code: "options_loader_unavailable"}} =
-             Jido.Chat.Teams.Adapter.load_options(event)
+    assert {:error, %{code: "options_loader_unavailable"}} =
+             load_options(event)
 
     group_loader = fn _event, _opts ->
       {:ok,
@@ -344,23 +365,23 @@ defmodule Jido.Chat.Teams.AdapterTest do
        }}
     end
 
-    assert {:error, %OptionsLoadError{code: "teams_option_groups_unsupported"}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: group_loader)
+    assert {:error, %{code: "teams_option_groups_unsupported"}} =
+             load_options(event, options_loader: group_loader)
 
     error_loader = fn _event, _opts -> {:error, :upstream_unavailable} end
 
-    assert {:error, %OptionsLoadError{code: "options_loader_error"}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: error_loader)
+    assert {:error, %{code: "options_loader_error"}} =
+             load_options(event, options_loader: error_loader)
 
     crashing_loader = fn _event, _opts -> raise "upstream crashed" end
 
-    assert {:error, %OptionsLoadError{code: "options_loader_error"}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: crashing_loader)
+    assert {:error, %{code: "options_loader_error"}} =
+             load_options(event, options_loader: crashing_loader)
 
     explicit_timeout_loader = fn _event, _opts -> {:error, :timeout} end
 
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 20}} =
-             Jido.Chat.Teams.Adapter.load_options(event,
+    assert {:error, %{kind: :timeout, timeout_ms: 20}} =
+             load_options(event,
                options_loader: explicit_timeout_loader
              )
 
@@ -369,40 +390,40 @@ defmodule Jido.Chat.Teams.AdapterTest do
       {:ok, %{options: []}}
     end
 
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 20}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: timeout_loader)
+    assert {:error, %{kind: :timeout, timeout_ms: 20}} =
+             load_options(event, options_loader: timeout_loader)
   end
 
   test "uses standard, adapter, event, and default options timeout precedence" do
     timeout_loader = fn _event, _opts -> {:error, :timeout} end
-    event = OptionsLoadEvent.new(%{action_id: "assignee", timeout_ms: 30})
+    event = options_query(%{action_id: "assignee", timeout_ms: 30})
 
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 10}} =
-             Jido.Chat.Teams.Adapter.load_options(event,
+    assert {:error, %{kind: :timeout, timeout_ms: 10}} =
+             load_options(event,
                options_loader: timeout_loader,
                timeout_ms: 10,
                options_timeout_ms: 20
              )
 
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 20}} =
-             Jido.Chat.Teams.Adapter.load_options(event,
+    assert {:error, %{kind: :timeout, timeout_ms: 20}} =
+             load_options(event,
                options_loader: timeout_loader,
                options_timeout_ms: 20
              )
 
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 30}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: timeout_loader)
+    assert {:error, %{kind: :timeout, timeout_ms: 30}} =
+             load_options(event, options_loader: timeout_loader)
 
-    event_without_timeout = OptionsLoadEvent.new(%{action_id: "assignee"})
+    event_without_timeout = options_query(%{action_id: "assignee"})
 
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 3_000}} =
-             Jido.Chat.Teams.Adapter.load_options(event_without_timeout,
+    assert {:error, %{kind: :timeout, timeout_ms: 3_000}} =
+             load_options(event_without_timeout,
                options_loader: timeout_loader
              )
   end
 
   test "returns a typed timeout when the options loader exceeds the selected timeout" do
-    event = OptionsLoadEvent.new(%{action_id: "assignee", timeout_ms: 100})
+    event = options_query(%{action_id: "assignee", timeout_ms: 100})
 
     timeout_loader = fn _event, _opts ->
       Process.sleep(100)
@@ -410,13 +431,13 @@ defmodule Jido.Chat.Teams.AdapterTest do
     end
 
     assert {:error,
-            %OptionsLoadError{
+            %{
               kind: :timeout,
               code: "options_load_timeout",
               retryable: true,
               timeout_ms: 10
             }} =
-             Jido.Chat.Teams.Adapter.load_options(event,
+             load_options(event,
                options_loader: timeout_loader,
                timeout_ms: 10
              )
@@ -427,6 +448,47 @@ defmodule Jido.Chat.Teams.AdapterTest do
     verifier = fn ^request, _opts -> :ok end
 
     assert :ok = Jido.Chat.Teams.Adapter.verify_webhook(request, verifier: verifier)
+  end
+
+  defp native_binding do
+    {:ok, binding} =
+      Jido.Chat.bind(Jido.Chat.Teams.Adapter, id: "teams-test", verifier: fn _, _ -> :ok end)
+
+    Process.put(:teams_binding, binding)
+    binding
+  end
+
+  defp normalize(payload, verified \\ true) do
+    input = if verified, do: WebhookRequest.new(%{payload: payload}), else: payload
+    assert {:ok, %{signals: [fact]}} = Jido.Chat.normalize_event(native_binding(), input)
+    fact
+  end
+
+  defp options_query(attrs) do
+    Process.put(:event_timeout, attrs[:timeout_ms])
+
+    data = %{
+      "request_id" => "options-test",
+      "interaction_id" => "invoke-1",
+      "query" => attrs[:query] || "",
+      "action_id" => attrs[:action_id]
+    }
+
+    Jido.Chat.Signal.LoadOptions.new!(data)
+  end
+
+  defp load_options(event, opts \\ []),
+    do:
+      Jido.Chat.Teams.Adapter.load_options(
+        event,
+        Keyword.put_new(opts, :event_timeout_ms, Process.get(:event_timeout))
+      )
+
+  defp execute_options(event, opts) do
+    {:ok, binding} =
+      Jido.Chat.bind(Jido.Chat.Teams.Adapter, Keyword.put(opts, :id, "options-binding"))
+
+    Jido.Chat.execute(binding, event)
   end
 
   defp conversation_ref do

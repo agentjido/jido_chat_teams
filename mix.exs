@@ -44,9 +44,35 @@ defmodule Jido.Chat.Teams.MixProject do
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
+  # The published beta lacks the Signal API used by this migration.
+  defp signal_test_dependency do
+    {:jido_signal,
+     git: "https://github.com/agentjido/jido_signal.git",
+     ref: "d6611eca1c95eb507843baceb55991e4801d8421",
+     only: [:dev, :test],
+     override: true}
+  end
+
+  defp chat_dependency do
+    case {Mix.env(), System.get_env("JIDO_CHAT_PATH")} do
+      {env, path} when env in [:dev, :test] and is_binary(path) and path != "" ->
+        {:jido_chat, path: Path.expand(path, __DIR__), override: true}
+
+      {env, _} when env in [:dev, :test] ->
+        {:jido_chat,
+         git: "https://github.com/agentjido/jido_chat.git",
+         ref: "2a9c21a860cb8c5f1069a865a981a8be035f56c0",
+         override: true}
+
+      _ ->
+        {:jido_chat, "~> 2.0"}
+    end
+  end
+
   defp deps do
     [
-      {:jido_chat, "~> 1.2 and >= 1.2.1"},
+      chat_dependency(),
+      signal_test_dependency(),
       {:req, "~> 0.7"},
       {:jason, "~> 1.4"},
       {:jose, "~> 1.11"},
