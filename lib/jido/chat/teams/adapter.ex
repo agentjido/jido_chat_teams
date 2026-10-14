@@ -1,34 +1,12 @@
 defmodule Jido.Chat.Teams.Adapter do
-  @moduledoc """
-  Microsoft Teams `Jido.Chat.Adapter` implementation.
-
-  Live messages use Microsoft Bot Connector Activity Protocol endpoints. The
-  adapter keeps Microsoft Graph out of the required message path.
-  """
-
+  @moduledoc "Microsoft Teams `Jido.Chat.Adapter` implementation.\n\nLive messages use Microsoft Bot Connector Activity Protocol endpoints. The\nadapter keeps Microsoft Graph out of the required message path.\n"
   use Jido.Chat.Adapter
-
-  alias Jido.Chat.{
-    ActionEvent,
-    ChannelInfo,
-    EventEnvelope,
-    Incoming,
-    OptionsLoadError,
-    OptionsLoadEvent,
-    OptionsLoadResult,
-    PostPayload,
-    ReactionEvent,
-    Response,
-    WebhookRequest,
-    WebhookResponse
-  }
-
+  alias Jido.Chat.{ChannelInfo, PostPayload, WebhookRequest, WebhookResponse}
   alias Jido.Chat.Teams.{CardRenderer, ConversationRef}
   alias Jido.Chat.Teams.Auth.JwtVerifier
   alias Jido.Chat.Teams.Transport.ReqClient
-
   @card_content_type "application/vnd.microsoft.card.adaptive"
-  @default_options_timeout_ms 3_000
+  @default_options_timeout_ms 3000
   @media_type_pattern ~r/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/
   @media_kind_extensions %{
     ".aac" => :audio,
@@ -56,9 +34,10 @@ defmodule Jido.Chat.Teams.Adapter do
     ".webm" => :video,
     ".webp" => :image
   }
-
   @impl true
-  def channel_type, do: :teams
+  def channel_type do
+    :teams
+  end
 
   @impl true
   @spec capabilities() :: map()
@@ -89,7 +68,7 @@ defmodule Jido.Chat.Teams.Adapter do
       load_options: :native,
       webhook: :native,
       verify_webhook: :native,
-      parse_event: :native,
+      normalize_event: :native,
       format_webhook_response: :native,
       text: :native,
       markdown: :fallback,
@@ -112,10 +91,11 @@ defmodule Jido.Chat.Teams.Adapter do
   end
 
   @impl true
-  def listener_child_specs(_bridge_id, _opts \\ []), do: {:ok, []}
+  def listener_child_specs(_bridge_id, _opts \\ []) do
+    {:ok, []}
+  end
 
-  @impl true
-  def transform_incoming(payload) when is_map(payload) do
+  defp provider_message(payload) when is_map(payload) do
     with type when type in ["message", "messageUpdate", "messageDelete"] <- value(payload, :type),
          {:ok, reference} <- conversation_reference(payload),
          room_id when is_binary(room_id) <- external_room_id(reference),
@@ -125,12 +105,17 @@ defmodule Jido.Chat.Teams.Adapter do
       was_mentioned = Enum.any?(mentions, &(&1.is_self == true))
       text = payload |> value(:text) |> clean_text(mentions)
       chat_type = chat_type(reference.scope)
-      thread_id = if reference.scope == :channel, do: reference.conversation_id
+
+      thread_id =
+        if reference.scope == :channel do
+          reference.conversation_id
+        end
+
       delivery_reference = ConversationRef.encode(reference)
       from = value(payload, :from) || %{}
 
       {:ok,
-       Incoming.new(%{
+       %{
          external_room_id: room_id,
          external_user_id: value(from, :aadObjectId) || value(from, :id),
          text: text,
@@ -172,7 +157,7 @@ defmodule Jido.Chat.Teams.Adapter do
            conversation_id: reference.conversation_id,
            activity_type: type
          }
-       })}
+       }}
     else
       nil -> {:error, :invalid_activity}
       type when is_binary(type) -> {:error, {:unsupported_activity_type, type}}
@@ -181,11 +166,13 @@ defmodule Jido.Chat.Teams.Adapter do
     end
   end
 
-  def transform_incoming(_payload), do: {:error, :invalid_activity}
+  defp provider_message(_payload) do
+    {:error, :invalid_activity}
+  end
 
   @impl true
   def send_message(external_room_id, text, opts \\ []) when is_binary(text) do
-    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+    with {:ok, reference} <- delivery_reference(external_room_id, opts),
          activity <- message_activity(text, opts),
          {:ok, result} <- send_activity(reference, activity, opts) do
       {:ok, response(reference, external_room_id, result, :sent)}
@@ -199,7 +186,7 @@ defmodule Jido.Chat.Teams.Adapter do
         {:error, :attachments_unsupported}
 
       payload.kind == :card ->
-        with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+        with {:ok, reference} <- delivery_reference(external_room_id, opts),
              {:ok, card} <- render_card(payload.card || payload.raw),
              activity <- card_activity(card, payload, opts),
              {:ok, result} <- send_activity(reference, activity, opts) do
@@ -207,7 +194,7 @@ defmodule Jido.Chat.Teams.Adapter do
         end
 
       payload.kind == :raw and is_map(payload.raw) ->
-        with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+        with {:ok, reference} <- delivery_reference(external_room_id, opts),
              {:ok, result} <- send_activity(reference, normalize_struct(payload.raw), opts) do
           {:ok, response(reference, external_room_id, result, :sent)}
         end
@@ -219,7 +206,7 @@ defmodule Jido.Chat.Teams.Adapter do
 
   @impl true
   def edit_message(external_room_id, message_id, text, opts \\ []) when is_binary(text) do
-    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+    with {:ok, reference} <- delivery_reference(external_room_id, opts),
          {:ok, result} <-
            transport(opts).update_activity(
              reference,
@@ -233,16 +220,15 @@ defmodule Jido.Chat.Teams.Adapter do
 
   @impl true
   def delete_message(external_room_id, message_id, opts \\ []) do
-    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
-         {:ok, _result} <-
-           transport(opts).delete_activity(reference, stringify(message_id), opts) do
+    with {:ok, reference} <- delivery_reference(external_room_id, opts),
+         {:ok, _result} <- transport(opts).delete_activity(reference, stringify(message_id), opts) do
       :ok
     end
   end
 
   @impl true
   def start_typing(external_room_id, opts \\ []) do
-    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
+    with {:ok, reference} <- delivery_reference(external_room_id, opts),
          {:ok, _result} <- transport(opts).send_activity(reference, %{"type" => "typing"}, opts) do
       :ok
     end
@@ -250,7 +236,7 @@ defmodule Jido.Chat.Teams.Adapter do
 
   @impl true
   def fetch_metadata(external_room_id, opts \\ []) do
-    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts) do
+    with {:ok, reference} <- delivery_reference(external_room_id, opts) do
       {:ok,
        ChannelInfo.new(%{
          id: reference.channel_id || reference.conversation_id,
@@ -262,7 +248,7 @@ defmodule Jido.Chat.Teams.Adapter do
 
   @impl true
   def fetch_thread(external_room_id, opts \\ []) do
-    with {:ok, reference} <- ConversationRef.cast(external_room_id, opts) do
+    with {:ok, reference} <- delivery_reference(external_room_id, opts) do
       {:ok,
        %{
          id: "team:#{reference.conversation_id}",
@@ -271,7 +257,9 @@ defmodule Jido.Chat.Teams.Adapter do
          external_room_id: external_room_id,
          external_thread_id:
            opts[:external_thread_id] ||
-             if(reference.scope == :channel, do: reference.conversation_id),
+             if reference.scope == :channel do
+               reference.conversation_id
+             end,
          is_dm: reference.scope == :personal,
          metadata: %{conversation_ref: ConversationRef.to_map(reference)}
        }}
@@ -279,9 +267,9 @@ defmodule Jido.Chat.Teams.Adapter do
   end
 
   @impl true
-  def load_options(%OptionsLoadEvent{} = event, opts \\ []) do
+  def load_options(%Jido.Signal{type: "jido.chat.query.load_options"} = event, opts \\ []) do
     timeout_ms =
-      opts[:timeout_ms] || opts[:options_timeout_ms] || event.timeout_ms ||
+      opts[:timeout_ms] || opts[:options_timeout_ms] || opts[:event_timeout_ms] ||
         @default_options_timeout_ms
 
     with {:ok, loader} <- fetch_options_loader(opts),
@@ -301,78 +289,32 @@ defmodule Jido.Chat.Teams.Adapter do
   end
 
   @impl true
-  def parse_event(%WebhookRequest{} = request, _opts \\ []) do
-    payload = request.payload
-
-    case {value(payload, :type), value(payload, :name)} do
-      {type, _name} when type in ["message", "messageUpdate", "messageDelete"] ->
-        with {:ok, incoming} <- transform_incoming(payload) do
-          {:ok,
-           EventEnvelope.new(%{
-             id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
-             adapter_name: :teams,
-             event_type: :message,
-             thread_id: incoming.external_thread_id,
-             channel_id: stringify(incoming.external_room_id),
-             message_id: stringify(incoming.external_message_id),
-             payload: incoming,
-             raw: normalize_struct(payload),
-             metadata: %{activity_type: type}
-           })}
-        end
-
-      {"messageReaction", _name} ->
-        parse_reaction_event(payload)
-
-      {"invoke", "application/search"} ->
-        parse_options_load_event(payload)
-
-      {"invoke", _name} ->
-        parse_action_event(payload)
-
-      {type, _name}
-      when type in ["conversationUpdate", "installationUpdate", "event", "typing"] ->
-        {:ok, :noop}
-
-      {nil, _name} ->
-        {:error, :missing_activity_type}
-
-      {type, _name} ->
-        {:error, {:unsupported_activity_type, type}}
-    end
-  end
-
-  @impl true
   def format_webhook_response(result, opts \\ [])
 
-  def format_webhook_response(
-        {:ok, _chat, %EventEnvelope{event_type: :options_load, payload: payload}},
-        _opts
-      ) do
-    format_options_load_response({:ok, payload})
+  def format_webhook_response({:ok, %Jido.Chat.Delivery{}}, opts) do
+    WebhookResponse.new(%{status: 200, body: opts[:invoke_response] || ""})
   end
 
-  def format_webhook_response({:ok, %OptionsLoadResult{} = result}, _opts) do
+  def format_webhook_response(
+        {:ok,
+         %Jido.Signal{
+           type: "jido.chat.operation.completed",
+           data: %{"operation" => "load_options", "result" => result}
+         }},
+        _opts
+      ) do
     format_options_load_response({:ok, result})
   end
 
-  def format_webhook_response({:error, %OptionsLoadError{} = error}, _opts) do
-    format_options_load_response({:error, error})
-  end
-
-  def format_webhook_response({:ok, _chat, _event}, opts) do
-    case Keyword.get(opts, :invoke_response) do
-      nil ->
-        WebhookResponse.new(%{status: 200, headers: %{"content-type" => "text/plain"}, body: ""})
-
-      response ->
-        WebhookResponse.new(%{
-          status: 200,
-          headers: %{"content-type" => "application/json"},
-          body: response
-        })
-    end
-  end
+  def format_webhook_response(
+        {:ok,
+         %Jido.Signal{
+           type: "jido.chat.operation.failed",
+           data: %{"operation" => "load_options"} = data
+         }},
+        _opts
+      ),
+      do: WebhookResponse.error(if(data["retryable"], do: 504, else: 400), %{error: data["code"]})
 
   def format_webhook_response({:error, reason}, _opts)
       when reason in [
@@ -388,16 +330,24 @@ defmodule Jido.Chat.Teams.Adapter do
     WebhookResponse.error(401, %{error: to_string(reason)})
   end
 
-  def format_webhook_response({:error, reason}, _opts) do
-    WebhookResponse.error(400, %{error: inspect(reason)})
+  def format_webhook_response({:error, %Jido.Chat.Errors.Contract{code: code}}, _opts) do
+    WebhookResponse.error(400, %{error: to_string(code)})
   end
 
-  @doc "Formats a typed options-load result as a Teams search invoke response."
-  @spec format_options_load_response(
-          {:ok, OptionsLoadResult.t()}
-          | {:error, OptionsLoadError.t()}
-        ) :: WebhookResponse.t()
-  def format_options_load_response({:ok, %OptionsLoadResult{} = result}) do
+  def format_webhook_response(_, _opts) do
+    WebhookResponse.error(400, %{error: "rejected"})
+  end
+
+  @doc "Formats a private Teams options response from a validated native operation result."
+  @spec format_options_load_response({:ok, map() | Jido.Signal.t()} | {:error, map()}) ::
+          WebhookResponse.t()
+  def format_options_load_response({:ok, %Jido.Signal{data: %{"result" => result}}}) do
+    format_options_load_response({:ok, result})
+  end
+
+  def format_options_load_response({:ok, result}) when is_map(result) do
+    options = value(result, :options) || []
+
     WebhookResponse.new(%{
       status: 200,
       headers: %{"content-type" => "application/json"},
@@ -405,75 +355,25 @@ defmodule Jido.Chat.Teams.Adapter do
         "type" => "application/vnd.microsoft.search.searchResponse",
         "value" => %{
           "results" =>
-            Enum.map(result.options, fn option ->
-              %{"title" => option.label, "value" => option.value}
+            Enum.map(options, fn option ->
+              %{"title" => value(option, :label), "value" => value(option, :value)}
             end)
         }
       }
     })
   end
 
-  def format_options_load_response({:error, %OptionsLoadError{} = error}) do
-    status = if(error.kind == :timeout, do: 504, else: 400)
-
+  def format_options_load_response({:error, %{code: code} = error}) do
     WebhookResponse.new(%{
-      status: status,
+      status:
+        if error[:kind] == :timeout do
+          504
+        else
+          400
+        end,
       headers: %{"content-type" => "application/json"},
-      body: %{
-        "error" => %{
-          "code" => error.code,
-          "message" => error.message,
-          "retryable" => error.retryable
-        }
-      }
+      body: %{"error" => %{"code" => code, "retryable" => error.retryable}}
     })
-  end
-
-  @impl true
-  def handle_webhook(%Jido.Chat{} = chat, payload, opts \\ []) when is_map(payload) do
-    request =
-      WebhookRequest.new(%{
-        adapter_name: :teams,
-        headers: opts[:headers] || %{},
-        payload: payload,
-        raw: opts[:raw_body] || payload
-      })
-
-    with :ok <- verify_webhook(request, opts),
-         {:ok, event} <- parse_event(request, opts),
-         {:ok, next_chat, incoming} <- route_event(chat, event, opts) do
-      {:ok, next_chat, incoming}
-    end
-  end
-
-  defp route_event(chat, :noop, _opts) do
-    {:ok, chat,
-     Incoming.new(%{
-       external_room_id: "team:noop",
-       external_message_id: Jido.Chat.ID.generate!(),
-       text: nil,
-       metadata: %{noop: true}
-     })}
-  end
-
-  defp route_event(chat, %EventEnvelope{} = envelope, opts) do
-    with {:ok, next_chat, routed_event} <- Jido.Chat.process_event(chat, :teams, envelope, opts) do
-      incoming =
-        case routed_event.payload do
-          %Incoming{} = incoming ->
-            incoming
-
-          _other ->
-            Incoming.new(%{
-              external_room_id: routed_event.channel_id || "team:event",
-              external_message_id: routed_event.message_id || routed_event.id,
-              text: nil,
-              metadata: %{event_type: routed_event.event_type}
-            })
-        end
-
-      {:ok, next_chat, incoming}
-    end
   end
 
   defp send_activity(reference, activity, opts) do
@@ -486,7 +386,9 @@ defmodule Jido.Chat.Teams.Adapter do
     end
   end
 
-  defp transport(opts), do: Keyword.get(opts, :transport, ReqClient)
+  defp transport(opts) do
+    Keyword.get(opts, :transport, ReqClient)
+  end
 
   defp message_activity(text, opts) do
     %{
@@ -502,17 +404,14 @@ defmodule Jido.Chat.Teams.Adapter do
     %{
       "type" => "message",
       "text" => PostPayload.display_text(payload) || "",
-      "attachments" => [
-        %{
-          "contentType" => @card_content_type,
-          "content" => card
-        }
-      ]
+      "attachments" => [%{"contentType" => @card_content_type, "content" => card}]
     }
     |> maybe_put("channelData", opts[:channel_data])
   end
 
-  defp render_card(nil), do: {:error, :missing_card}
+  defp render_card(nil) do
+    {:error, :missing_card}
+  end
 
   defp render_card(card) do
     {:ok, CardRenderer.render(card)}
@@ -523,7 +422,7 @@ defmodule Jido.Chat.Teams.Adapter do
   defp response(reference, external_room_id, result, status) do
     message_id = value(result, :id) || value(result, :activityId)
 
-    Response.new(%{
+    %{
       external_message_id: message_id,
       external_room_id: external_room_id,
       channel_type: :teams,
@@ -533,7 +432,7 @@ defmodule Jido.Chat.Teams.Adapter do
         conversation_id: reference.conversation_id,
         conversation_ref: ConversationRef.encode(reference)
       }
-    })
+    }
   end
 
   defp put_result_id(result, message_id) when is_map(result) do
@@ -566,8 +465,9 @@ defmodule Jido.Chat.Teams.Adapter do
   end
 
   defp activity_scope(_conversation, team, channel)
-       when map_size(team) > 0 or map_size(channel) > 0,
-       do: :channel
+       when map_size(team) > 0 or map_size(channel) > 0 do
+    :channel
+  end
 
   defp activity_scope(conversation, _team, _channel) do
     case value(conversation, :conversationType) do
@@ -582,12 +482,25 @@ defmodule Jido.Chat.Teams.Adapter do
     reference.channel_id || reference.team_id || reference.conversation_id
   end
 
-  defp external_room_id(%ConversationRef{} = reference), do: reference.conversation_id
+  defp external_room_id(%ConversationRef{} = reference) do
+    reference.conversation_id
+  end
 
-  defp chat_type(:personal), do: :private
-  defp chat_type(:group_chat), do: :group
-  defp chat_type(:channel), do: :channel
-  defp chat_type(_scope), do: :private
+  defp chat_type(:personal) do
+    :private
+  end
+
+  defp chat_type(:group_chat) do
+    :group
+  end
+
+  defp chat_type(:channel) do
+    :channel
+  end
+
+  defp chat_type(_scope) do
+    :private
+  end
 
   defp chat_title(payload) do
     channel_data = value(payload, :channelData) || %{}
@@ -635,7 +548,9 @@ defmodule Jido.Chat.Teams.Adapter do
     |> String.trim()
   end
 
-  defp clean_text(_text, _mentions), do: nil
+  defp clean_text(_text, _mentions) do
+    nil
+  end
 
   defp extract_media(payload) do
     payload
@@ -662,16 +577,17 @@ defmodule Jido.Chat.Teams.Adapter do
     end)
   end
 
-  defp card_content_type?(nil), do: false
+  defp card_content_type?(nil) do
+    false
+  end
 
-  defp card_content_type?(content_type),
-    do: canonical_media_type(content_type) == @card_content_type
+  defp card_content_type?(content_type) do
+    canonical_media_type(content_type) == @card_content_type
+  end
 
   defp attachment_kind(media_type, filename, url) do
-    media_kind_from_type(media_type) ||
-      media_kind_from_reference(filename) ||
-      media_kind_from_reference(url) ||
-      :file
+    media_kind_from_type(media_type) || media_kind_from_reference(filename) ||
+      media_kind_from_reference(url) || :file
   end
 
   defp media_kind_from_type(media_type) when is_binary(media_type) do
@@ -683,7 +599,9 @@ defmodule Jido.Chat.Teams.Adapter do
     end
   end
 
-  defp media_kind_from_type(_media_type), do: nil
+  defp media_kind_from_type(_media_type) do
+    nil
+  end
 
   defp media_kind_from_reference(reference) when is_binary(reference) do
     reference
@@ -696,165 +614,38 @@ defmodule Jido.Chat.Teams.Adapter do
     |> then(&Map.get(@media_kind_extensions, &1))
   end
 
-  defp media_kind_from_reference(_reference), do: nil
+  defp media_kind_from_reference(_reference) do
+    nil
+  end
 
   defp normalize_media_type(value) when is_binary(value) do
     trimmed = String.trim(value)
 
-    if Regex.match?(@media_type_pattern, canonical_media_type(trimmed)),
-      do: trimmed,
-      else: nil
+    if Regex.match?(@media_type_pattern, canonical_media_type(trimmed)) do
+      trimmed
+    else
+      nil
+    end
   end
 
-  defp normalize_media_type(_value), do: nil
+  defp normalize_media_type(_value) do
+    nil
+  end
 
   defp canonical_media_type(value) do
-    value
-    |> String.split(";", parts: 2)
-    |> hd()
-    |> String.trim()
-    |> String.downcase()
+    value |> String.split(";", parts: 2) |> hd() |> String.trim() |> String.downcase()
   end
 
-  defp blank_to_nil(value) when is_binary(value),
-    do: if(String.trim(value) == "", do: nil, else: value)
-
-  defp blank_to_nil(_value), do: nil
-
-  defp parse_reaction_event(payload) do
-    added = value(payload, :reactionsAdded) |> List.wrap()
-    removed = value(payload, :reactionsRemoved) |> List.wrap()
-
-    {reaction, added?} =
-      if added == [], do: {List.first(removed), false}, else: {List.first(added), true}
-
-    if is_map(reaction) do
-      conversation = value(payload, :conversation) || %{}
-      from = value(payload, :from) || %{}
-      activity_id = stringify(value(payload, :replyToId) || value(payload, :id))
-      channel_id = conversation |> value(:id) |> stringify()
-
-      event =
-        ReactionEvent.new(%{
-          adapter: __MODULE__,
-          adapter_name: :teams,
-          thread_id: channel_id,
-          channel_id: channel_id,
-          message_id: activity_id,
-          emoji: stringify(value(reaction, :type)),
-          added: added?,
-          user: %{
-            user_id: stringify(value(from, :aadObjectId) || value(from, :id)),
-            user_name: value(from, :name)
-          },
-          raw: normalize_struct(payload),
-          metadata: %{reactions_added: added, reactions_removed: removed}
-        })
-
-      {:ok,
-       EventEnvelope.new(%{
-         id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
-         adapter_name: :teams,
-         event_type: :reaction,
-         thread_id: channel_id,
-         channel_id: channel_id,
-         message_id: activity_id,
-         payload: event,
-         raw: normalize_struct(payload)
-       })}
+  defp blank_to_nil(value) when is_binary(value) do
+    if String.trim(value) == "" do
+      nil
     else
-      {:error, :missing_reaction}
+      value
     end
   end
 
-  defp parse_action_event(payload) do
-    conversation = value(payload, :conversation) || %{}
-    from = value(payload, :from) || %{}
-    raw_value = value(payload, :value) || %{}
-    action = value(raw_value, :action) || raw_value
-    channel_id = stringify(value(conversation, :id))
-    message_id = stringify(value(payload, :replyToId) || value(payload, :id))
-
-    event =
-      ActionEvent.new(%{
-        adapter: __MODULE__,
-        adapter_name: :teams,
-        thread_id: channel_id,
-        channel_id: channel_id,
-        message_id: message_id,
-        action_id:
-          stringify(value(action, :verb) || value(action, :action_id) || value(payload, :name)),
-        value: action_value(action),
-        trigger_id: stringify(value(payload, :id)),
-        user: %{
-          user_id: stringify(value(from, :aadObjectId) || value(from, :id)),
-          user_name: value(from, :name)
-        },
-        raw: normalize_struct(payload),
-        metadata: %{invoke_name: value(payload, :name)}
-      })
-
-    {:ok,
-     EventEnvelope.new(%{
-       id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
-       adapter_name: :teams,
-       event_type: :action,
-       thread_id: channel_id,
-       channel_id: channel_id,
-       message_id: message_id,
-       payload: event,
-       raw: normalize_struct(payload)
-     })}
-  end
-
-  defp parse_options_load_event(payload) do
-    conversation = value(payload, :conversation) || %{}
-    from = value(payload, :from) || %{}
-    request = value(payload, :value) || %{}
-    query_options = value(request, :queryOptions) || %{}
-    channel_id = stringify(value(conversation, :id))
-    message_id = stringify(value(payload, :replyToId) || value(payload, :id))
-
-    dataset = stringify(value(request, :dataset) || value(request, :action_id))
-
-    if is_binary(dataset) and String.trim(dataset) != "" do
-      event =
-        OptionsLoadEvent.new(%{
-          adapter: __MODULE__,
-          adapter_name: :teams,
-          action_id: dataset,
-          query: stringify(value(request, :queryText)) || "",
-          limit: positive_integer(value(query_options, :top)),
-          timeout_ms: positive_integer(value(request, :timeoutMs)),
-          thread_id: channel_id,
-          channel_id: channel_id,
-          message_id: message_id,
-          user: %{
-            user_id: stringify(value(from, :aadObjectId) || value(from, :id)),
-            user_name: value(from, :name)
-          },
-          raw: normalize_struct(payload),
-          metadata: %{
-            associated_inputs: normalize_struct(value(request, :data) || %{}),
-            skip: non_negative_integer(value(query_options, :skip))
-          }
-        })
-
-      {:ok,
-       EventEnvelope.new(%{
-         id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
-         adapter_name: :teams,
-         event_type: :options_load,
-         thread_id: channel_id,
-         channel_id: channel_id,
-         message_id: message_id,
-         payload: event,
-         raw: normalize_struct(payload),
-         metadata: %{invoke_name: "application/search"}
-       })}
-    else
-      {:error, :missing_options_dataset}
-    end
+  defp blank_to_nil(_value) do
+    nil
   end
 
   defp fetch_options_loader(opts) do
@@ -897,7 +688,10 @@ defmodule Jido.Chat.Teams.Adapter do
     after
       timeout_ms ->
         Process.exit(pid, :kill)
-        receive do: ({:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok)
+
+        receive do
+          {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok
+        end
 
         receive do
           {^reply_ref, _late_result} -> :ok
@@ -905,18 +699,21 @@ defmodule Jido.Chat.Teams.Adapter do
           0 -> :ok
         end
 
-        {:error, OptionsLoadError.timeout(timeout_ms)}
+        {:error, options_timeout(timeout_ms)}
     end
   end
 
-  defp invoke_options_loader(loader, event, opts) when is_function(loader, 2),
-    do: loader.(event, opts)
+  defp invoke_options_loader(loader, event, opts) when is_function(loader, 2) do
+    loader.(event, opts)
+  end
 
-  defp invoke_options_loader(loader, event, _opts) when is_function(loader, 1),
-    do: loader.(event)
+  defp invoke_options_loader(loader, event, _opts) when is_function(loader, 1) do
+    loader.(event)
+  end
 
-  defp invoke_options_loader({module, function, args}, event, opts),
-    do: apply(module, function, [event, opts | args])
+  defp invoke_options_loader({module, function, args}, event, opts) do
+    apply(module, function, [event, opts | args])
+  end
 
   defp safely_invoke_options_loader(loader, event, opts) do
     {:ok, invoke_options_loader(loader, event, opts)}
@@ -926,34 +723,29 @@ defmodule Jido.Chat.Teams.Adapter do
     kind, reason -> {:error, {kind, reason}}
   end
 
-  defp normalize_options_result({:ok, %OptionsLoadResult{} = result}, _timeout_ms),
-    do: {:ok, result}
-
   defp normalize_options_result({:ok, result}, _timeout_ms) when is_map(result) do
-    {:ok, OptionsLoadResult.new(result)}
+    options = value(result, :options) || []
+    groups = value(result, :option_groups) || []
+
+    {:ok,
+     %{options: Enum.map(options, &Jido.Chat.OptionsLoadOption.new/1), option_groups: groups}}
   rescue
-    exception -> {:error, options_loader_error(exception)}
+    _ -> {:error, options_loader_error(:invalid_result)}
   end
 
-  defp normalize_options_result({:error, %OptionsLoadError{} = error}, _timeout_ms),
-    do: {:error, error}
+  defp normalize_options_result({:error, :timeout}, timeout_ms) do
+    {:error, options_timeout(timeout_ms)}
+  end
 
-  defp normalize_options_result({:error, :timeout}, timeout_ms),
-    do: {:error, OptionsLoadError.timeout(timeout_ms)}
+  defp normalize_options_result({:error, reason}, _timeout_ms) do
+    {:error, options_loader_error(reason)}
+  end
 
-  defp normalize_options_result({:error, reason}, _timeout_ms),
-    do: {:error, options_loader_error(reason)}
+  defp normalize_options_result(_, _timeout_ms) do
+    {:error, options_error("invalid_options_loader_result", "Invalid loader result")}
+  end
 
-  defp normalize_options_result(other, _timeout_ms),
-    do:
-      {:error,
-       options_error(
-         "invalid_options_loader_result",
-         "The options loader returned an invalid result",
-         %{result: inspect(other)}
-       )}
-
-  defp validate_options_result(%OptionsLoadResult{option_groups: [_ | _]}, _event) do
+  defp validate_options_result(%{option_groups: [_ | _]}, _event) do
     {:error,
      options_error(
        "teams_option_groups_unsupported",
@@ -961,9 +753,9 @@ defmodule Jido.Chat.Teams.Adapter do
      )}
   end
 
-  defp validate_options_result(%OptionsLoadResult{options: options}, event) do
+  defp validate_options_result(%{options: options}, event) do
     max_choices = CardRenderer.max_choices()
-    limit = min(event.limit || max_choices, max_choices)
+    limit = min(event.data["limit"] || max_choices, max_choices)
     option_count = length(options)
 
     if option_count <= limit do
@@ -978,24 +770,27 @@ defmodule Jido.Chat.Teams.Adapter do
     end
   end
 
-  defp options_loader_error(reason) do
-    options_error(
-      "options_loader_error",
-      "The options loader failed",
-      %{reason: inspect(reason)}
-    )
+  defp options_timeout(timeout_ms) do
+    %{
+      kind: :timeout,
+      code: "options_load_timeout",
+      class: :recoverable,
+      retryable: true,
+      timeout_ms: timeout_ms
+    }
+  end
+
+  defp options_loader_error(_reason) do
+    options_error("options_loader_error", "The options loader failed", %{})
   end
 
   defp options_error(code, message, metadata \\ %{}) do
-    OptionsLoadError.new(%{
-      code: code,
-      message: message,
-      retryable: false,
-      metadata: metadata
-    })
+    %{kind: :provider, code: code, message: message, retryable: false, metadata: metadata}
   end
 
-  defp action_value(value) when is_binary(value), do: value
+  defp action_value(value) when is_binary(value) do
+    value
+  end
 
   defp action_value(value) when is_map(value) do
     case value(value, :value) do
@@ -1004,32 +799,634 @@ defmodule Jido.Chat.Teams.Adapter do
     end
   end
 
-  defp action_value(_value), do: nil
+  defp action_value(_value) do
+    nil
+  end
 
-  defp positive_integer(value) when is_integer(value) and value > 0, do: value
-  defp positive_integer(_value), do: nil
+  defp positive_integer(value) when is_integer(value) and value > 0 do
+    value
+  end
 
-  defp non_negative_integer(value) when is_integer(value) and value >= 0, do: value
-  defp non_negative_integer(_value), do: nil
+  defp positive_integer(_value) do
+    nil
+  end
 
   defp value(map, key) when is_map(map) and is_atom(key) do
     Map.get(map, key) || Map.get(map, Atom.to_string(key))
   end
 
-  defp value(_map, _key), do: nil
+  defp value(_map, _key) do
+    nil
+  end
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+  defp maybe_put(map, _key, nil) do
+    map
+  end
 
-  defp stringify(nil), do: nil
-  defp stringify(value) when is_binary(value), do: value
-  defp stringify(value), do: to_string(value)
+  defp maybe_put(map, key, value) do
+    Map.put(map, key, value)
+  end
 
-  defp normalize_struct(%_{} = struct), do: struct |> Map.from_struct() |> normalize_struct()
+  defp stringify(nil) do
+    nil
+  end
 
-  defp normalize_struct(map) when is_map(map),
-    do: Map.new(map, fn {key, value} -> {key, normalize_struct(value)} end)
+  defp stringify(value) when is_binary(value) do
+    value
+  end
 
-  defp normalize_struct(list) when is_list(list), do: Enum.map(list, &normalize_struct/1)
-  defp normalize_struct(value), do: value
+  defp stringify(value) do
+    to_string(value)
+  end
+
+  defp normalize_struct(%_{} = struct) do
+    struct |> Map.from_struct() |> normalize_struct()
+  end
+
+  defp normalize_struct(map) when is_map(map) do
+    Map.new(map, fn {key, value} -> {key, normalize_struct(value)} end)
+  end
+
+  defp normalize_struct(list) when is_list(list) do
+    Enum.map(list, &normalize_struct/1)
+  end
+
+  defp normalize_struct(value) do
+    value
+  end
+
+  @impl true
+  def signal_protocol do
+    1
+  end
+
+  @impl true
+  def normalize_event(binding, input) do
+    tracker = {__MODULE__, make_ref()}
+    Process.put(tracker, [])
+
+    result =
+      try do
+        with {:ok, items} <- native_inputs(binding, input) do
+          delivery =
+            "teams:delivery:" <> native_digest({binding.id, Enum.map(items, &elem(&1, 2))})
+
+          base = %{binding: binding, delivery: delivery, tracker: tracker}
+
+          with {:ok, facts} <- native_items(base, items) do
+            Jido.Chat.Delivery.new(binding, delivery, facts)
+          end
+        end
+      rescue
+        _ -> Jido.Chat.Signal.Policy.error(:invalid_delivery)
+      catch
+        _, _ -> Jido.Chat.Signal.Policy.error(:invalid_delivery)
+      end
+
+    if match?({:error, _}, result) do
+      Enum.each(Process.get(tracker, []), &Jido.Chat.cancel_resource(binding, &1))
+    end
+
+    Process.delete(tracker)
+    result
+  end
+
+  defp native_items(base, items) do
+    items
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {{kind, payload, key}, index}, {:ok, acc} ->
+      context = Map.merge(base, %{item: "teams:item:" <> key, index: index})
+      existing = Process.get(context.tracker)
+
+      result =
+        try do
+          native_map(context, kind, payload)
+        rescue
+          _ -> {:error, :invalid_item}
+        catch
+          _, _ -> {:error, :invalid_item}
+        end
+
+      case result do
+        {:ok, facts} ->
+          facts = List.wrap(facts)
+
+          if Enum.all?(facts, &(&1.type == "jido.chat.normalization.failed")) do
+            Enum.each(
+              Process.get(context.tracker) -- existing,
+              &Jido.Chat.cancel_resource(base.binding, &1)
+            )
+          end
+
+          {:cont, {:ok, acc ++ facts}}
+
+        {:error, %Jido.Chat.Errors.Contract{code: code}} = error
+        when code in [
+               :signal_too_large,
+               :delivery_too_large,
+               :too_many_signals,
+               :too_many_failures
+             ] ->
+          {:halt, error}
+
+        _ ->
+          Enum.each(
+            Process.get(context.tracker) -- existing,
+            &Jido.Chat.cancel_resource(base.binding, &1)
+          )
+
+          case native_failure(context, "invalid_item", kind, nil) do
+            {:ok, fact} -> {:cont, {:ok, acc ++ [fact]}}
+            error -> {:halt, error}
+          end
+      end
+    end)
+  end
+
+  defp native_fact(context, definition, data, ordinal \\ "0") do
+    room = data["room_id"]
+
+    data =
+      data
+      |> Map.merge(%{
+        "item_id" => context.item <> ":" <> definition.type() <> ":" <> ordinal,
+        "delivery_id" => context.delivery
+      })
+      |> Map.reject(fn {key, value} ->
+        is_nil(value) and key not in ["text", "previous", "current", "actor_id"]
+      end)
+
+    subject =
+      if is_binary(room) and room != "" do
+        Jido.Chat.Signal.Identity.conversation_subject(context.binding.id, room)
+      end
+
+    definition.new(data, source: context.binding.source, subject: subject)
+  end
+
+  defp native_failure(context, code, kind, room) do
+    native_fact(context, Jido.Chat.Signal.NormalizationFailed, %{
+      "code" => code,
+      "provider_kind" => kind,
+      "item_index" => context.index,
+      "room_id" => room
+    })
+  end
+
+  defp native_media(context, media) do
+    Enum.reduce_while(media, {:ok, []}, fn value, {:ok, acc} ->
+      with {:ok, ref} <- Jido.Chat.put_resource(context.binding, "media", value) do
+        Process.put(context.tracker, [ref | Process.get(context.tracker)])
+
+        item =
+          %{"kind" => to_string(value.kind), "resource_ref" => ref}
+          |> native_optional("name", value.filename)
+          |> native_optional("media_type", value.media_type)
+
+        {:cont, {:ok, acc ++ [item]}}
+      else
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp native_get(map, key) when is_map(map) do
+    atom =
+      try do
+        String.to_existing_atom(key)
+      rescue
+        ArgumentError -> nil
+      end
+
+    if Map.has_key?(map, key) do
+      Map.get(map, key)
+    else
+      Map.get(map, atom)
+    end
+  end
+
+  defp native_get(_, _) do
+    nil
+  end
+
+  defp native_id(map, key) do
+    native_identifier(native_get(map, key))
+  end
+
+  defp native_identifier(value) when is_binary(value) and value != "" do
+    value
+  end
+
+  defp native_identifier(value) when is_integer(value) do
+    to_string(value)
+  end
+
+  defp native_identifier(_) do
+    nil
+  end
+
+  defp native_optional(map, _, nil) do
+    map
+  end
+
+  defp native_optional(map, key, value) do
+    Map.put(map, key, value)
+  end
+
+  defp native_time(%DateTime{} = value) do
+    DateTime.to_iso8601(value)
+  end
+
+  defp native_time(value) when is_binary(value) do
+    value
+  end
+
+  defp native_time(_) do
+    nil
+  end
+
+  defp native_canonical(%_{} = value) do
+    value |> Map.from_struct() |> native_canonical()
+  end
+
+  defp native_canonical(value) when is_map(value) do
+    value |> Enum.map(fn {k, v} -> {to_string(k), native_canonical(v)} end) |> Enum.sort()
+  end
+
+  defp native_canonical(value) when is_list(value) do
+    Enum.map(value, &native_canonical/1)
+  end
+
+  defp native_canonical(value) do
+    value
+  end
+
+  defp native_digest(value) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(native_canonical(value), [:deterministic]))
+    |> Base.url_encode64(padding: false)
+  end
+
+  @impl true
+  def configure_binding(opts) do
+    opts =
+      opts
+      |> Keyword.put_new(:transport, ReqClient)
+      |> Keyword.put_new(:verifier, JwtVerifier)
+      |> Keyword.put_new(:reference_store, :ets.new(:teams_references, [:set, :public]))
+
+    opts =
+      Enum.reduce([:app_id, :app_password], opts, fn key, acc ->
+        value =
+          case Jido.Chat.Teams.Auth.credential(opts, key) do
+            {:ok, value} -> value
+            _ -> ""
+          end
+
+        Keyword.put(acc, key, value)
+      end)
+
+    {:ok, opts}
+  end
+
+  defp delivery_reference(room, opts) do
+    case opts[:reference_store] && :ets.lookup(opts[:reference_store], room) do
+      [{^room, binding, ref}] ->
+        case Jido.Chat.resolve_resource(binding, ref) do
+          {:ok, %{reference: reference}} -> {:ok, reference}
+          error -> error
+        end
+
+      _ ->
+        ConversationRef.cast(room, opts)
+    end
+  end
+
+  defp native_inputs(binding, %WebhookRequest{} = request) do
+    with :ok <- verify_webhook(request, binding.options) do
+      payload = request.payload
+      key = native_id(payload, "id") || native_digest(payload)
+      room = native_id(native_get(payload, "conversation"), "id")
+
+      {:ok,
+       [
+         {native_get(payload, "type") || "unknown", {:verified, payload},
+          native_digest({room, key})}
+       ]}
+    end
+  end
+
+  defp native_inputs(binding, items) when is_list(items) do
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+      case native_inputs(binding, item) do
+        {:ok, values} -> {:cont, {:ok, acc ++ values}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp native_inputs(_binding, payload) when is_map(payload) do
+    key = native_id(payload, "id") || native_digest(payload)
+
+    {:ok,
+     [
+       {native_get(payload, "type") || "unknown", payload,
+        native_digest({native_id(native_get(payload, "conversation"), "id"), key})}
+     ]}
+  end
+
+  defp native_inputs(_, _) do
+    {:ok, [{"invalid", nil, "invalid"}]}
+  end
+
+  defp native_map(context, kind, {:verified, payload}) do
+    with {:ok, facts} <- native_activity(context, kind, payload) do
+      with false <- Enum.all?(List.wrap(facts), &(&1.type == "jido.chat.normalization.failed")),
+           {:ok, reference} <- conversation_reference(payload),
+           {:ok, ref} <-
+             Jido.Chat.put_resource(context.binding, "result", %{
+               reference: reference,
+               activity: payload
+             }) do
+        Process.put(context.tracker, [ref | Process.get(context.tracker)])
+
+        :ets.insert(
+          context.binding.options[:reference_store],
+          {external_room_id(reference), context.binding, ref}
+        )
+      end
+
+      {:ok, facts}
+    end
+  end
+
+  defp native_map(context, kind, payload) do
+    native_activity(context, kind, payload)
+  end
+
+  defp native_room(payload) do
+    data = native_get(payload, "channelData") || %{}
+
+    native_id(native_get(data, "channel"), "id") ||
+      native_id(native_get(payload, "conversation"), "id")
+  end
+
+  defp native_actor(payload) do
+    native_id(native_get(payload, "from"), "aadObjectId") ||
+      native_id(native_get(payload, "from"), "id")
+  end
+
+  defp native_activity(context, type, payload) when type in ["message", "messageUpdate"] do
+    with {:ok, incoming} <- provider_message(payload),
+         {:ok, media} <- native_media(context, Enum.map(incoming.media, &Jido.Chat.Media.new/1)) do
+      mentions = incoming.mentions
+
+      sender =
+        if native_identifier(incoming.external_user_id),
+          do:
+            %{"id" => native_identifier(incoming.external_user_id)}
+            |> native_optional("display_name", incoming.display_name)
+
+      definition =
+        if type == "message" do
+          Jido.Chat.Signal.MessageReceived
+        else
+          Jido.Chat.Signal.MessageUpdated
+        end
+
+      data = %{
+        "room_id" => incoming.external_room_id,
+        "message_id" => incoming.external_message_id,
+        "sender" => sender,
+        "text" => incoming.text,
+        "thread_id" => incoming.external_thread_id,
+        "media" => media,
+        "timestamp" => native_time(incoming.timestamp)
+      }
+
+      data =
+        if type == "message" do
+          Map.merge(data, %{
+            "conversation_name" => incoming.chat_title,
+            "conversation_kind" =>
+              case incoming.chat_type do
+                :private -> "direct"
+                :group -> "group"
+                _ -> "channel"
+              end,
+            "mentioned" => incoming.was_mentioned,
+            "mentions" => Enum.map(mentions, & &1.user_id),
+            "mention_details" =>
+              Enum.map(mentions, fn m ->
+                %{"id" => m.user_id} |> native_optional("username", m.username)
+              end),
+            "reply_to_id" => incoming.external_reply_to_id
+          })
+        else
+          data
+        end
+
+      native_fact(context, definition, data)
+    end
+  end
+
+  defp native_activity(context, "messageDelete", payload) do
+    native_fact(context, Jido.Chat.Signal.MessageDeleted, %{
+      "room_id" => native_room(payload),
+      "message_id" => native_id(payload, "id"),
+      "actor_id" => native_actor(payload)
+    })
+  end
+
+  defp native_activity(context, "messageReaction", payload) do
+    groups = [
+      {"reactionsAdded", Jido.Chat.Signal.ReactionAdded},
+      {"reactionsRemoved", Jido.Chat.Signal.ReactionRemoved}
+    ]
+
+    Enum.reduce_while(groups, {:ok, []}, fn {key, definition}, {:ok, acc} ->
+      result =
+        native_many(
+          %{context | item: context.item <> key},
+          native_get(payload, key) || [],
+          fn reaction, index ->
+            native_fact(
+              context,
+              definition,
+              %{
+                "room_id" => native_room(payload),
+                "message_id" => native_id(payload, "replyToId") || native_id(payload, "id"),
+                "actor_id" => native_actor(payload),
+                "reaction" => native_get(reaction, "type")
+              },
+              key <> to_string(index)
+            )
+          end
+        )
+
+      case result do
+        {:ok, facts} -> {:cont, {:ok, acc ++ facts}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp native_activity(context, "conversationUpdate", payload) do
+    groups = [
+      {"membersAdded", "joined", "member", true, "explicit_join"},
+      {"membersRemoved", "left", "left", false, "explicit_leave"}
+    ]
+
+    Enum.reduce_while(groups, {:ok, []}, fn {key, transition, status, present, evidence},
+                                            {:ok, acc} ->
+      result =
+        native_many(
+          %{context | item: context.item <> key},
+          native_get(payload, key) || [],
+          fn member, index ->
+            native_member(
+              context,
+              payload,
+              member,
+              transition,
+              status,
+              present,
+              evidence,
+              key <> to_string(index)
+            )
+          end
+        )
+
+      case result do
+        {:ok, facts} -> {:cont, {:ok, acc ++ facts}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp native_activity(context, "installationUpdate", payload) do
+    case native_get(payload, "action") do
+      "add" ->
+        native_member(
+          context,
+          payload,
+          native_get(payload, "recipient"),
+          "joined",
+          "member",
+          true,
+          "explicit_join",
+          "install"
+        )
+
+      "remove" ->
+        native_member(
+          context,
+          payload,
+          native_get(payload, "recipient"),
+          "left",
+          "left",
+          false,
+          "explicit_leave",
+          "install"
+        )
+
+      _ ->
+        native_failure(context, "unsupported_item", "installationUpdate", native_room(payload))
+    end
+  end
+
+  defp native_activity(context, "invoke", payload) do
+    request = native_get(payload, "value") || %{}
+
+    base = %{
+      "room_id" => native_room(payload),
+      "interaction_id" => native_id(payload, "id"),
+      "actor_id" => native_actor(payload)
+    }
+
+    case native_get(payload, "name") do
+      "application/search" ->
+        native_fact(
+          context,
+          Jido.Chat.Signal.OptionsRequested,
+          Map.merge(base, %{
+            "action_id" => native_get(request, "dataset") || native_get(request, "action_id"),
+            "query" => native_get(request, "queryText") || "",
+            "limit" => positive_integer(native_get(native_get(request, "queryOptions"), "top"))
+          })
+        )
+
+      name ->
+        action = native_get(request, "action") || request
+
+        native_fact(
+          context,
+          Jido.Chat.Signal.ActionReceived,
+          Map.merge(base, %{
+            "action_id" => native_get(action, "verb") || native_get(action, "action_id") || name,
+            "value" => action_value(action),
+            "message_id" => native_id(payload, "replyToId") || native_id(payload, "id")
+          })
+        )
+    end
+  end
+
+  defp native_activity(_context, type, _payload) when type in ["typing", "event"] do
+    {:ok, []}
+  end
+
+  defp native_activity(context, kind, _payload) do
+    native_failure(context, "unsupported_item", kind, nil)
+  end
+
+  defp native_member(context, payload, member, transition, status, present, evidence, ordinal) do
+    id = native_id(member, "aadObjectId") || native_id(member, "id")
+    bot = native_id(native_get(payload, "recipient"), "id") || context.binding.options[:bot_id]
+
+    native_fact(
+      context,
+      Jido.Chat.Signal.MembershipChanged,
+      %{
+        "room_id" => native_room(payload),
+        "participant_id" => id,
+        "actor_id" => native_actor(payload),
+        "bot_self" => id != nil and id == bot,
+        "transition" => transition,
+        "evidence" => evidence,
+        "previous" => nil,
+        "current" => %{"status" => status, "is_member" => present}
+      },
+      ordinal
+    )
+  end
+
+  defp native_many(context, items, fun) do
+    items
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {item, index}, {:ok, acc} ->
+      case fun.(item, index) do
+        {:ok, fact} ->
+          {:cont, {:ok, acc ++ [fact]}}
+
+        {:error, %Jido.Chat.Errors.Contract{code: code}} = error
+        when code in [
+               :signal_too_large,
+               :delivery_too_large,
+               :too_many_signals,
+               :too_many_failures
+             ] ->
+          {:halt, error}
+
+        _ ->
+          {:ok, failure} =
+            native_failure(
+              %{context | index: index, item: context.item <> to_string(index)},
+              "invalid_item",
+              "activity_item",
+              nil
+            )
+
+          {:cont, {:ok, acc ++ [failure]}}
+      end
+    end)
+  end
 end
