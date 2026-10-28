@@ -7,8 +7,6 @@ defmodule Jido.Chat.Teams.Auth.JwtVerifier do
   """
 
   alias Jido.Chat.Teams.Auth
-  alias Jido.Chat.WebhookRequest
-
   @default_issuer "https://api.botframework.com"
   @default_keys_url "https://login.botframework.com/v1/.well-known/keys"
   @keys_table :jido_chat_teams_openid_keys_cache
@@ -16,8 +14,8 @@ defmodule Jido.Chat.Teams.Auth.JwtVerifier do
   @default_clock_skew_seconds 300
 
   @doc "Verifies an inbound webhook request."
-  @spec verify(WebhookRequest.t(), keyword()) :: :ok | {:error, term()}
-  def verify(%WebhookRequest{} = request, opts \\ []) do
+  @spec verify(map(), keyword()) :: :ok | {:error, term()}
+  def verify(request, opts \\ []) when is_map(request) do
     case verify_with_claims(request, opts) do
       {:ok, _claims} -> :ok
       {:error, _reason} = error -> error
@@ -25,13 +23,14 @@ defmodule Jido.Chat.Teams.Auth.JwtVerifier do
   end
 
   @doc "Verifies an inbound request and returns its JWT claims."
-  @spec verify_with_claims(WebhookRequest.t(), keyword()) :: {:ok, map()} | {:error, term()}
-  def verify_with_claims(%WebhookRequest{} = request, opts \\ []) do
+  @spec verify_with_claims(map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def verify_with_claims(request, opts \\ []) when is_map(request) do
     with {:ok, token} <- bearer_token(request),
          {:ok, app_id} <- Auth.credential(opts, :app_id),
          {:ok, keys} <- signing_keys(opts),
          {:ok, claims} <- verify_signature(token, keys),
-         :ok <- validate_claims(claims, request.payload, app_id, opts) do
+         :ok <-
+           validate_claims(claims, request[:payload] || request["payload"] || %{}, app_id, opts) do
       {:ok, claims}
     end
   end
@@ -43,8 +42,10 @@ defmodule Jido.Chat.Teams.Auth.JwtVerifier do
     :ok
   end
 
-  defp bearer_token(%WebhookRequest{} = request) do
-    case WebhookRequest.header(request, "authorization") do
+  defp bearer_token(request) do
+    headers = request[:headers] || request["headers"] || %{}
+
+    case Map.get(headers, "authorization") || Map.get(headers, "Authorization") do
       value when is_binary(value) ->
         case String.split(value, ~r/\s+/, parts: 2, trim: true) do
           [scheme, token] ->

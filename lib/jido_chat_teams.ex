@@ -10,4 +10,13 @@ defmodule Jido.Chat.Teams do
   @doc "Returns the canonical adapter module."
   @spec adapter() :: module()
   def adapter, do: Adapter
+
+  @doc "Returns the incoming facts normalized by Teams."
+  def event_definitions do
+    [
+      Jido.Chat.Signal.MessageReceived,
+      Jido.Chat.Signal.MessageUpdated,
+      Jido.Chat.Signal.NormalizationFailed
+    ]
+  end
 end

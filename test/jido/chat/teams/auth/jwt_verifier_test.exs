@@ -2,7 +2,6 @@ defmodule Jido.Chat.Teams.Auth.JwtVerifierTest do
   use ExUnit.Case, async: true
 
   alias Jido.Chat.Teams.Auth.JwtVerifier
-  alias Jido.Chat.WebhookRequest
 
   @app_id "00000000-0000-0000-0000-000000000001"
   @service_url "https://smba.trafficmanager.net/amer/"
@@ -64,7 +63,7 @@ defmodule Jido.Chat.Teams.Auth.JwtVerifierTest do
   end
 
   test "rejects a request with no authorization header", ctx do
-    request = WebhookRequest.new(%{payload: %{"serviceUrl" => @service_url}})
+    request = %{payload: %{"serviceUrl" => @service_url}, headers: %{}}
 
     assert {:error, :missing_authorization} =
              JwtVerifier.verify(request, app_id: @app_id, jwks: ctx.jwks, now: @now)
@@ -88,10 +87,9 @@ defmodule Jido.Chat.Teams.Auth.JwtVerifierTest do
   end
 
   defp request(token) do
-    WebhookRequest.new(%{
-      adapter_name: :teams,
+    %{
       headers: %{"authorization" => "Bearer #{token}"},
       payload: %{"serviceUrl" => @service_url}
-    })
+    }
   end
 end
