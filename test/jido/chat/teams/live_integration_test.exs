@@ -10,6 +10,8 @@ defmodule Jido.Chat.Teams.LiveIntegrationTest do
   @conversation_ref System.get_env("TEAMS_TEST_CONVERSATION_REF")
   @reply_to_id System.get_env("TEAMS_TEST_REPLY_TO_ID")
 
+  @auth_opts [app_id: @app_id, app_password: @app_password]
+
   @moduletag :live
   @moduletag :teams_live
 
@@ -26,8 +28,12 @@ defmodule Jido.Chat.Teams.LiveIntegrationTest do
   setup_all do
     assert {:ok, reference} = ConversationRef.decode(@conversation_ref || "")
 
-    {:ok, reference: reference, opts: [app_id: @app_id, app_password: @app_password]}
+    {:ok, reference: reference, opts: auth_opts(System.get_env("MICROSOFT_APP_TENANT_ID"))}
   end
+
+  defp auth_opts(nil), do: @auth_opts
+  defp auth_opts(""), do: @auth_opts
+  defp auth_opts(tenant), do: [app_tenant_id: tenant] ++ @auth_opts
 
   test "sends, edits, types, and deletes a live Teams activity", ctx do
     text = "jido team live #{System.system_time(:millisecond)}"

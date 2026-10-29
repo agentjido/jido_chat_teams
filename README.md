@@ -107,6 +107,19 @@ credentials = %{
 The token cache gets a Bot Connector access token when it is necessary. You can
 pass `access_token: "..."` for a short test.
 
+A single-tenant bot also needs its Microsoft Entra tenant. Add `app_tenant_id`
+with the tenant GUID or domain, such as `contoso.onmicrosoft.com`. The adapter then
+gets tokens from that tenant's endpoint. Without `app_tenant_id`, it uses the
+multi-tenant `botframework.com` endpoint. An explicit `token_url` overrides both.
+
+```elixir
+opts = [
+  app_id: System.fetch_env!("MICROSOFT_APP_ID"),
+  app_password: System.fetch_env!("MICROSOFT_APP_PASSWORD"),
+  app_tenant_id: System.fetch_env!("MICROSOFT_APP_TENANT_ID")
+]
+```
+
 ## Adaptive Cards
 
 Use a canonical `Jido.Chat.PostPayload` with `kind: :card`:
@@ -212,7 +225,8 @@ TEAMS_TEST_CONVERSATION_REF=teamsref:v1:...
 TEAMS_TEST_REPLY_TO_ID=...
 ```
 
-`TEAMS_TEST_REPLY_TO_ID` is optional. Run the live suite with this command:
+`TEAMS_TEST_REPLY_TO_ID` is optional. Set `MICROSOFT_APP_TENANT_ID` too when the
+test bot is single-tenant. Run the live suite with this command:
 
 ```shell
 mix test --include live test/jido/chat/team/live_integration_test.exs

@@ -24,7 +24,11 @@ defmodule Jido.Chat.Teams.Auth.TokenCache do
   @spec invalidate(keyword()) :: :ok
   def invalidate(opts) when is_list(opts) do
     ensure_table()
-    :ets.delete(@table, cache_key(opts))
+
+    with {:ok, token_url} <- Auth.token_url(opts) do
+      :ets.delete(@table, cache_key(opts, token_url))
+    end
+
     :ok
   end
 
@@ -37,7 +41,13 @@ defmodule Jido.Chat.Teams.Auth.TokenCache do
 
   defp fetch_cached(opts) do
     ensure_table()
-    key = cache_key(opts)
+
+    with {:ok, token_url} <- Auth.token_url(opts) do
+      lookup_or_fetch(opts, cache_key(opts, token_url))
+    end
+  end
+
+  defp lookup_or_fetch(opts, key) do
     now = System.system_time(:second)
 
     case :ets.lookup(@table, key) do
@@ -53,9 +63,9 @@ defmodule Jido.Chat.Teams.Auth.TokenCache do
     end
   end
 
-  defp cache_key(opts) do
+  # The resolved URL keeps tokens for different app tenants apart.
+  defp cache_key(opts, token_url) do
     app_id = credential_value(opts, [:app_id, :microsoft_app_id, :client_id])
-    token_url = Keyword.get(opts, :token_url, :default)
     scope = Keyword.get(opts, :scope, :default)
     {app_id, token_url, scope}
   end
