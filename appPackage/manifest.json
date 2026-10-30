@@ -28,7 +28,7 @@
       "botId": "${MICROSOFT_APP_ID}",
       "scopes": ["personal", "team", "groupChat"],
       "isNotificationOnly": false,
-      "supportsFiles": false
+      "supportsFiles": true
     }
   ],
   "permissions": ["identity", "messageTeamMembers"],

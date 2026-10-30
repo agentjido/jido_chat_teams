@@ -3,6 +3,7 @@ defmodule Jido.Chat.Teams.AdapterTest do
 
   alias Jido.Chat.{
     ActionEvent,
+    Media,
     OptionsLoadError,
     OptionsLoadEvent,
     OptionsLoadResult,
@@ -39,6 +40,28 @@ defmodule Jido.Chat.Teams.AdapterTest do
       send(opts[:test_pid], {:delete_activity, reference, activity_id})
       {:ok, true}
     end
+
+    @impl true
+    def download_media(url, opts) do
+      send(opts[:test_pid], {:download_media, url})
+      {:ok, "media-bytes"}
+    end
+  end
+
+  defmodule NoMediaTransport do
+    @behaviour Jido.Chat.Teams.Transport
+
+    @impl true
+    def send_activity(_reference, _activity, _opts), do: {:ok, %{}}
+
+    @impl true
+    def reply_to_activity(_reference, _activity_id, _activity, _opts), do: {:ok, %{}}
+
+    @impl true
+    def update_activity(_reference, _activity_id, _activity, _opts), do: {:ok, %{}}
+
+    @impl true
+    def delete_activity(_reference, _activity_id, _opts), do: {:ok, true}
   end
 
   test "declares a valid Jido.Chat capability matrix" do
@@ -52,6 +75,7 @@ defmodule Jido.Chat.Teams.AdapterTest do
     assert capabilities.external_select == :native
     assert capabilities.options_load == :native
     assert capabilities.link_action_ids == :native
+    assert capabilities.fetch_media == :native
   end
 
   test "normalizes a channel message and preserves a delivery reference" do
@@ -438,6 +462,96 @@ defmodule Jido.Chat.Teams.AdapterTest do
       team_id: "team-1",
       channel_id: "channel-1"
     })
+  end
+
+  describe "inbound media" do
+    @image_url "https://smba.trafficmanager.net/amer/v3/attachments/0-abc/views/original"
+    @download_url "https://contoso-my.sharepoint.com/personal/ada/_layouts/15/download.aspx?tempauth=x"
+    @file_page_url "https://contoso-my.sharepoint.com/personal/ada/Documents/report.pdf"
+
+    test "reports the downloadUrl of a personal-chat file as its media url" do
+      file = %{
+        "contentType" => "application/vnd.microsoft.teams.file.download.info",
+        "contentUrl" => @file_page_url,
+        "name" => "report.pdf",
+        "content" => %{"downloadUrl" => @download_url, "uniqueId" => "file-1"}
+      }
+
+      assert {:ok, incoming} =
+               Jido.Chat.Teams.Adapter.transform_incoming(personal_activity([file]))
+
+      assert [media] = incoming.media
+      assert media.url == @download_url
+      assert media.filename == "report.pdf"
+      assert media.metadata.content_url == @file_page_url
+    end
+
+    test "keeps the contentUrl of a pasted image" do
+      image = %{"contentType" => "image/png", "contentUrl" => @image_url}
+
+      assert {:ok, incoming} =
+               Jido.Chat.Teams.Adapter.transform_incoming(personal_activity([image]))
+
+      assert [%{kind: :image, url: @image_url}] = incoming.media
+    end
+
+    test "fetches a URL reference through the transport" do
+      assert {:ok, "media-bytes"} =
+               Jido.Chat.Teams.Adapter.fetch_media(@image_url, media_opts())
+
+      assert_received {:download_media, @image_url}
+    end
+
+    test "prefers the downloadUrl of a Media struct or a string-keyed map" do
+      media = %Media{
+        kind: :file,
+        url: @file_page_url,
+        metadata: %{content: %{"downloadUrl" => @download_url}}
+      }
+
+      map = %{
+        "url" => @file_page_url,
+        "metadata" => %{"content" => %{"downloadUrl" => @download_url}}
+      }
+
+      assert {:ok, _bytes} = Jido.Chat.Teams.Adapter.fetch_media(media, media_opts())
+      assert_received {:download_media, @download_url}
+      assert {:ok, _bytes} = Jido.Chat.Teams.Adapter.fetch_media(map, media_opts())
+      assert_received {:download_media, @download_url}
+    end
+
+    test "uses the url of a Media struct without a downloadUrl" do
+      media = %Media{kind: :image, url: @image_url}
+
+      assert {:ok, _bytes} = Jido.Chat.Teams.Adapter.fetch_media(media, media_opts())
+      assert_received {:download_media, @image_url}
+    end
+
+    for reference <- [nil, "  ", %{}, %Media{url: nil}] do
+      test "rejects the media reference #{inspect(reference)}" do
+        assert {:error, :invalid_media_reference} =
+                 Jido.Chat.Teams.Adapter.fetch_media(
+                   unquote(Macro.escape(reference)),
+                   media_opts()
+                 )
+
+        refute_received {:download_media, _url}
+      end
+    end
+
+    test "reports a transport without media downloads as unsupported" do
+      assert {:error, :unsupported} =
+               Jido.Chat.Teams.Adapter.fetch_media(@image_url, transport: NoMediaTransport)
+    end
+  end
+
+  defp media_opts, do: [transport: FakeTransport, test_pid: self()]
+
+  defp personal_activity(attachments) do
+    channel_activity()
+    |> Map.put("conversation", %{"id" => "personal-1", "conversationType" => "personal"})
+    |> Map.put("channelData", %{"tenant" => %{"id" => "tenant-1"}})
+    |> Map.put("attachments", attachments)
   end
 
   defp channel_activity do

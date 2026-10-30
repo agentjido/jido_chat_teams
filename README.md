@@ -24,7 +24,7 @@ The spike includes these functions:
 - Run deterministic protocol and security tests with no Microsoft account.
 - Run an optional live suite after you add credentials and a conversation reference.
 
-The spike does not include files, Graph history, proactive conversation creation,
+The spike does not include files in channels/groups, Graph history, proactive conversation creation,
 ephemeral messages, or opening modal windows without an invoke activity. Reaction
 activities are parsed, but the adapter does not add or remove reactions. Microsoft
 Graph is not in the normal send path.
@@ -106,6 +106,28 @@ credentials = %{
 
 The token cache gets a Bot Connector access token when it is necessary. You can
 pass `access_token: "..."` for a short test.
+
+## Receive attachments
+
+`Incoming.media` lists the attachments of an inbound message. Download one with
+`Adapter.fetch_media/2`. It accepts the `Jido.Chat.Media` item, a media map, or a URL:
+
+```elixir
+{:ok, bytes} = Jido.Chat.Teams.Adapter.fetch_media(media, opts)
+```
+
+| Attachment | Where | How the adapter reads it |
+| --- | --- | --- |
+| Pasted image | Personal chat, group chat, channel | Bot Connector URL with the bot token |
+| File | Personal chat | Pre-authenticated `content.downloadUrl`, no token |
+| File | Group chat, channel | Not supported. It needs Microsoft Graph. |
+
+- For a personal-chat file, `Media.url` is the `downloadUrl` and
+  `metadata.content_url` is the OneDrive page. The `downloadUrl` is valid for only
+  a few minutes. Fetch the file soon after the message arrives.
+- The bot token goes only to the Bot Connector hosts in `:allowed_service_hosts`.
+  File downloads must use a host in `:allowed_file_hosts` (default: SharePoint).
+  Other URLs return `{:error, :untrusted_media_url}` and send no request.
 
 ## Adaptive Cards
 

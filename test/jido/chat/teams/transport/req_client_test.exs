@@ -105,6 +105,98 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
     refute_received {:request, _opts}
   end
 
+  describe "download_media/2" do
+    @image_url "https://smba.trafficmanager.net/amer/v3/attachments/0-abc/views/original"
+    @download_url "https://contoso-my.sharepoint.com/personal/ada/_layouts/15/download.aspx?tempauth=x"
+    @bytes <<137, 80, 78, 71, 13, 10, 26, 10>>
+
+    test "downloads a Bot Connector attachment with the bot token" do
+      responses([token(200, "token-1"), ok(200, @bytes)])
+
+      assert {:ok, @bytes} = ReqClient.download_media(@image_url, credentials())
+
+      assert_received {:request, token_request}
+      assert token_request[:url] =~ "login.microsoftonline.com"
+
+      assert_received {:request, request}
+      assert request[:method] == :get
+      assert request[:url] == @image_url
+      assert {"authorization", "Bearer token-1"} in request[:headers]
+      assert request[:decode_body] == false
+      assert request[:redirect_trusted] == false
+    end
+
+    test "gets a new token once after a 401" do
+      responses([token(200, "old-token"), ok(401, ""), token(200, "new-token"), ok(200, @bytes)])
+
+      assert {:ok, @bytes} = ReqClient.download_media(@image_url, credentials())
+
+      assert_received {:request, _token_request}
+      assert_received {:request, first}
+      assert {"authorization", "Bearer old-token"} in first[:headers]
+      assert_received {:request, _token_request}
+      assert_received {:request, second}
+      assert {"authorization", "Bearer new-token"} in second[:headers]
+    end
+
+    test "returns the HTTP status for other failures" do
+      responses([ok(404, "missing")])
+
+      assert {:error, {:http_error, 404}} =
+               ReqClient.download_media(@image_url, req: FakeReq, access_token: "direct-token")
+    end
+
+    test "downloads a pre-authenticated file URL without the bot token" do
+      responses([ok(200, "pdf-bytes")])
+
+      assert {:ok, "pdf-bytes"} = ReqClient.download_media(@download_url, credentials())
+
+      assert_received {:request, request}
+      assert request[:url] == @download_url
+      assert request[:headers] == []
+      refute_received {:request, _token_request}
+    end
+
+    test "never retries a file download with the bot token" do
+      responses([ok(401, "expired")])
+
+      assert {:error, {:http_error, 401}} = ReqClient.download_media(@download_url, credentials())
+
+      assert_received {:request, request}
+      assert request[:headers] == []
+      refute_received {:request, _request}
+    end
+
+    test "uses configured file hosts" do
+      responses([ok(200, "bytes")])
+
+      assert {:ok, "bytes"} =
+               ReqClient.download_media(
+                 "https://files.example.test/download?tempauth=x",
+                 credentials(allowed_file_hosts: ["files.example.test"])
+               )
+
+      assert_received {:request, request}
+      assert request[:headers] == []
+    end
+
+    for {url, reason} <- [
+          {"https://bad.example/v3/attachments/1", :untrusted_media_url},
+          {"http://smba.trafficmanager.net/amer/v3/attachments/1", :invalid_media_url}
+        ] do
+      test "refuses #{url} without a request" do
+        assert {:error, unquote(reason)} = ReqClient.download_media(unquote(url), credentials())
+        refute_received {:request, _request}
+      end
+    end
+  end
+
+  defp credentials(extra \\ []),
+    do: [req: FakeReq, app_id: "app-1", app_password: "secret"] ++ extra
+
+  defp token(status, access_token),
+    do: ok(status, %{"access_token" => access_token, "expires_in" => 3600})
+
   defp reference do
     ConversationRef.new(%{
       conversation_id: "19:thread@thread.tacv2",

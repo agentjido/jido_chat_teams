@@ -13,6 +13,7 @@ defmodule Jido.Chat.Teams.Adapter do
     ChannelInfo,
     EventEnvelope,
     Incoming,
+    Media,
     OptionsLoadError,
     OptionsLoadEvent,
     OptionsLoadResult,
@@ -75,6 +76,7 @@ defmodule Jido.Chat.Teams.Adapter do
       fetch_metadata: :fallback,
       fetch_thread: :fallback,
       fetch_message: :unsupported,
+      fetch_media: :native,
       add_reaction: :unsupported,
       remove_reaction: :unsupported,
       post_ephemeral: :unsupported,
@@ -275,6 +277,23 @@ defmodule Jido.Chat.Teams.Adapter do
          is_dm: reference.scope == :personal,
          metadata: %{conversation_ref: ConversationRef.to_map(reference)}
        }}
+    end
+  end
+
+  @doc """
+  Downloads the bytes of an inbound attachment.
+  """
+  @impl true
+  def fetch_media(reference, opts \\ []) do
+    transport = transport(opts)
+
+    with {:ok, url} <- media_url(reference),
+         true <- Code.ensure_loaded?(transport),
+         true <- function_exported?(transport, :download_media, 2) do
+      transport.download_media(url, opts)
+    else
+      false -> {:error, :unsupported}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -645,6 +664,8 @@ defmodule Jido.Chat.Teams.Adapter do
       content_type = attachment |> value(:contentType) |> normalize_media_type()
       content_url = attachment |> value(:contentUrl) |> blank_to_nil()
       filename = attachment |> value(:name) |> blank_to_nil()
+      content = value(attachment, :content)
+      download_url = content |> value(:downloadUrl) |> blank_to_nil()
 
       if card_content_type?(content_type) or is_nil(content_url) do
         []
@@ -652,14 +673,32 @@ defmodule Jido.Chat.Teams.Adapter do
         [
           %{
             kind: attachment_kind(content_type, filename, content_url),
-            url: content_url,
+            url: download_url || content_url,
             media_type: content_type,
             filename: filename,
-            metadata: %{content: value(attachment, :content)}
+            metadata: maybe_put(%{content: content}, :content_url, download_url && content_url)
           }
         ]
       end
     end)
+  end
+
+  # `content.downloadUrl` is public.
+  # But not `contentUrl`, it's the OneDrive page, which cannot be read without permission.
+  defp media_url(%Media{} = media), do: media |> Map.from_struct() |> media_url()
+
+  defp media_url(%{} = media) do
+    download_url = media |> value(:metadata) |> value(:content) |> value(:downloadUrl)
+    present_media_url(blank_to_nil(download_url) || value(media, :url))
+  end
+
+  defp media_url(url), do: present_media_url(url)
+
+  defp present_media_url(url) do
+    case blank_to_nil(url) do
+      nil -> {:error, :invalid_media_reference}
+      url -> {:ok, url}
+    end
   end
 
   defp card_content_type?(nil), do: false

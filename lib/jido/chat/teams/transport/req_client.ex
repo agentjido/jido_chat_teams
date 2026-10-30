@@ -1,6 +1,6 @@
 defmodule Jido.Chat.Teams.Transport.ReqClient do
   @moduledoc """
-  `Req` transport for Microsoft Bot Connector activities.
+  `Req` transport for Microsoft Bot Connector activities and inbound media.
   """
 
   @behaviour Jido.Chat.Teams.Transport
@@ -14,6 +14,9 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
     "smba.infra.gov.teams.microsoft.us",
     "smba.infra.dod.teams.microsoft.us"
   ]
+
+  # Hosts of the pre-authenticated `downloadUrl` of files sent in a personal chat.
+  @default_file_hosts ["sharepoint.com", "sharepoint.us", "sharepoint-mil.us"]
 
   @impl true
   def send_activity(%ConversationRef{} = reference, activity, opts) do
@@ -58,6 +61,91 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
       opts
     )
   end
+
+  @doc """
+  Downloads media bytes coming from Teams attachments.
+  """
+  @impl true
+  def download_media(url, opts) when is_binary(url) do
+    case media_auth(url, opts) do
+      {:ok, :bot_token} ->
+        download_with_token(url, opts, true)
+
+      {:ok, :pre_authenticated} ->
+        download(url, nil, opts, false)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp media_auth(url, opts), do: url |> URI.parse() |> uri_auth(opts)
+
+  defp uri_auth(%URI{scheme: "https", host: host}, opts) when is_binary(host) do
+    cond do
+      trusted_host?(host, service_hosts(opts)) -> {:ok, :bot_token}
+      trusted_host?(host, file_hosts(opts)) -> {:ok, :pre_authenticated}
+      true -> {:error, :untrusted_media_url}
+    end
+  end
+
+  defp uri_auth(_uri, _opts), do: {:error, :invalid_media_url}
+
+  defp service_hosts(opts), do: Keyword.get(opts, :allowed_service_hosts, @default_service_hosts)
+  defp file_hosts(opts), do: Keyword.get(opts, :allowed_file_hosts, @default_file_hosts)
+
+  # Req drops the authorization header on a redirect to another host.
+  defp download(url, token, opts, retry_auth?) do
+    req = Keyword.get(opts, :req, Req)
+
+    request_opts = [
+      method: :get,
+      url: url,
+      headers: media_headers(token),
+      decode_body: false,
+      retry: false,
+      redirect: true,
+      redirect_trusted: false,
+      max_redirects: 3
+    ]
+
+    case req.request(request_opts) do
+      {:ok, %Req.Response{status: status, body: body}}
+      when status in 200..299 and is_binary(body) ->
+        {:ok, body}
+
+      {:ok, %Req.Response{status: status}} when status in 200..299 ->
+        {:error, :invalid_media_body}
+
+      {:ok, %Req.Response{status: 401}} ->
+        retry_with_new_token? = retry_auth? and is_nil(Keyword.get(opts, :access_token))
+
+        if retry_with_new_token? do
+          TokenCache.invalidate(opts)
+          download_with_token(url, opts, false)
+        else
+          {:error, {:http_error, 401}}
+        end
+
+      {:ok, %Req.Response{status: 429} = response} ->
+        {:error, {:rate_limited, retry_after_ms(response)}}
+
+      {:ok, %Req.Response{status: status}} ->
+        {:error, {:http_error, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp download_with_token(url, opts, retry_auth?) do
+    with {:ok, token} <- TokenCache.fetch(opts) do
+      download(url, token, opts, retry_auth?)
+    end
+  end
+
+  defp media_headers(nil), do: []
+  defp media_headers(token), do: [{"authorization", "Bearer #{token}"}]
 
   defp request(method, url, body, reference, opts) do
     with :ok <- validate_service_url(reference.service_url, opts),

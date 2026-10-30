@@ -15,4 +15,8 @@ defmodule Jido.Chat.Teams.Transport do
 
   @callback delete_activity(ConversationRef.t(), String.t(), keyword()) ::
               {:ok, map() | boolean()} | {:error, term()}
+
+  @callback download_media(url :: String.t(), keyword()) :: {:ok, binary()} | {:error, term()}
+
+  @optional_callbacks download_media: 2
 end
