@@ -3,12 +3,17 @@ defmodule Jido.Chat.Teams.AdapterTest do
 
   alias Jido.Chat.{
     ActionEvent,
+    ChannelRef,
+    Incoming,
     Media,
+    MessageDeletedEvent,
+    MessageUpdatedEvent,
     OptionsLoadError,
     OptionsLoadEvent,
     OptionsLoadResult,
     PostPayload,
     ReactionEvent,
+    Thread,
     WebhookRequest
   }
 
@@ -44,8 +49,13 @@ defmodule Jido.Chat.Teams.AdapterTest do
     @impl true
     def download_media(url, opts) do
       send(opts[:test_pid], {:download_media, url})
+      send(opts[:test_pid], {:download_limit, opts[:max_media_bytes]})
       {:ok, "media-bytes"}
     end
+  end
+
+  defmodule TokenReq do
+    def request(_opts), do: Process.get(:token_response)
   end
 
   defmodule NoMediaTransport do
@@ -164,6 +174,46 @@ defmodule Jido.Chat.Teams.AdapterTest do
 
     assert misleading.kind == :file
     assert misleading.media_type == "application/pdf"
+  end
+
+  describe "verify_credentials/1" do
+    @credentials [
+      req: TokenReq,
+      app_id: "app-1",
+      app_password: "secret",
+      app_tenant_id: "tenant-1"
+    ]
+
+    test "accepts credentials that obtain a token" do
+      Process.put(
+        :token_response,
+        {:ok, %Req.Response{status: 200, body: %{"access_token" => "token-1"}}}
+      )
+
+      assert :ok = Jido.Chat.Teams.Adapter.verify_credentials(@credentials)
+    end
+
+    test "returns Microsoft's description of rejected credentials" do
+      Process.put(
+        :token_response,
+        {:ok,
+         %Req.Response{
+           status: 401,
+           body: %{
+             "error" => "invalid_client",
+             "error_description" => "AADSTS7000215: Invalid client secret"
+           }
+         }}
+      )
+
+      assert {:error, "AADSTS7000215: Invalid client secret"} =
+               Jido.Chat.Teams.Adapter.verify_credentials(@credentials)
+    end
+
+    test "reports a missing credential" do
+      assert {:error, {:missing_credential, :app_id}} =
+               Jido.Chat.Teams.Adapter.verify_credentials(req: TokenReq, app_password: "secret")
+    end
   end
 
   test "rejects unsupported activity types" do
@@ -309,6 +359,128 @@ defmodule Jido.Chat.Teams.AdapterTest do
 
     assert {:ok, action_envelope} = Jido.Chat.Teams.Adapter.parse_event(invoke_request)
     assert %ActionEvent{action_id: "approve", value: "42"} = action_envelope.payload
+  end
+
+  test "parses a new message into a message event" do
+    assert {:ok, envelope} = parse_activity(channel_activity())
+
+    assert %{event_type: :message, channel_id: "channel-1", message_id: "activity-1"} = envelope
+    assert %Incoming{text: "hello from Teams"} = envelope.payload
+  end
+
+  test "parses edited and restored messages into message-updated events" do
+    for event_type <- ["editMessage", "undeleteMessage"] do
+      activity =
+        channel_activity()
+        |> Map.put("type", "messageUpdate")
+        |> Map.put("text", "<at>Jido</at> hello again")
+        |> put_in(["channelData", "eventType"], event_type)
+
+      assert {:ok, envelope} = parse_activity(activity)
+
+      assert %{
+               event_type: :message_updated,
+               channel_id: "channel-1",
+               thread_id: "19:thread@thread.tacv2",
+               message_id: "activity-1"
+             } = envelope
+
+      assert %MessageUpdatedEvent{
+               adapter_name: :teams,
+               channel_id: "channel-1",
+               thread_id: "19:thread@thread.tacv2",
+               message_id: "activity-1",
+               author: %{user_id: "aad-user-1"},
+               timestamp: "2026-08-19T12:00:00Z",
+               message: %{text: "hello again", external_message_id: "activity-1"},
+               metadata: %{event_type: ^event_type}
+             } = envelope.payload
+    end
+  end
+
+  test "parses a deleted message into a message-deleted event without content" do
+    activity =
+      channel_activity()
+      |> Map.put("type", "messageDelete")
+      |> Map.delete("text")
+      |> Map.delete("entities")
+      |> put_in(["channelData", "eventType"], "softDeleteMessage")
+
+    assert {:ok, envelope} = parse_activity(activity)
+
+    assert %{event_type: :message_deleted, channel_id: "channel-1", message_id: "activity-1"} =
+             envelope
+
+    assert %MessageDeletedEvent{
+             channel_id: "channel-1",
+             message_id: "activity-1",
+             author: %{user_id: "aad-user-1"},
+             message: nil,
+             metadata: %{event_type: "softDeleteMessage"}
+           } = envelope.payload
+  end
+
+  test "gives lifecycle handlers the thread and channel of the message" do
+    chat =
+      Jido.Chat.new(adapters: %{teams: Jido.Chat.Teams.Adapter})
+      |> Jido.Chat.on_message_updated(&send(self(), {:lifecycle, &1}))
+      |> Jido.Chat.on_message_deleted(&send(self(), {:lifecycle, &1}))
+
+    channel_edit =
+      channel_activity()
+      |> Map.put("type", "messageUpdate")
+      |> put_in(["channelData", "eventType"], "editMessage")
+
+    personal_delete =
+      channel_activity()
+      |> Map.put("type", "messageDelete")
+      |> Map.put("conversation", %{"id" => "personal-1", "conversationType" => "personal"})
+      |> Map.put("channelData", %{
+        "tenant" => %{"id" => "tenant-1"},
+        "eventType" => "softDeleteMessage"
+      })
+      |> Map.delete("text")
+      |> Map.delete("entities")
+
+    for activity <- [channel_edit, personal_delete] do
+      assert {:ok, envelope} = parse_activity(activity)
+      assert {:ok, _chat, _event} = Jido.Chat.process_event(chat, :teams, envelope, [])
+    end
+
+    assert_received {:lifecycle, %MessageUpdatedEvent{} = edited}
+    assert edited.thread_id == "19:thread@thread.tacv2"
+    assert edited.message.thread_id == edited.thread_id
+
+    assert %Thread{
+             id: "19:thread@thread.tacv2",
+             external_room_id: "channel-1",
+             external_thread_id: "19:thread@thread.tacv2",
+             adapter: Jido.Chat.Teams.Adapter,
+             is_dm: false,
+             metadata: %{delivery_external_room_id: "teamsref:v1:" <> _}
+           } = edited.thread
+
+    assert %ChannelRef{
+             id: "teams:channel-1",
+             external_id: "channel-1",
+             metadata: %{is_dm: false}
+           } = edited.channel
+
+    assert_received {:lifecycle, %MessageDeletedEvent{} = deleted}
+    assert deleted.thread_id == "teams:personal-1"
+
+    assert %Thread{
+             id: "teams:personal-1",
+             external_room_id: "personal-1",
+             external_thread_id: nil,
+             is_dm: true
+           } = deleted.thread
+
+    assert %ChannelRef{
+             id: "teams:personal-1",
+             external_id: "personal-1",
+             metadata: %{is_dm: true}
+           } = deleted.channel
   end
 
   test "parses Teams dynamic-search invokes into normalized options-load events" do
@@ -535,6 +707,17 @@ defmodule Jido.Chat.Teams.AdapterTest do
       assert_received {:download_media, @image_url}
     end
 
+    test "passes the byte limit of a bounded fetch to the transport" do
+      assert {:ok, "media-bytes"} =
+               Jido.Chat.Teams.Adapter.fetch_bounded_media(@image_url, 1_024, media_opts())
+
+      assert_received {:download_media, @image_url}
+      assert_received {:download_limit, 1_024}
+
+      assert {:ok, "media-bytes"} = Jido.Chat.Teams.Adapter.fetch_media(@image_url, media_opts())
+      assert_received {:download_limit, nil}
+    end
+
     test "prefers the downloadUrl of a Media struct or a string-keyed map" do
       media = %Media{
         kind: :file,
@@ -585,6 +768,12 @@ defmodule Jido.Chat.Teams.AdapterTest do
     |> Map.put("conversation", %{"id" => "personal-1", "conversationType" => "personal"})
     |> Map.put("channelData", %{"tenant" => %{"id" => "tenant-1"}})
     |> Map.put("attachments", attachments)
+  end
+
+  defp parse_activity(activity) do
+    Jido.Chat.Teams.Adapter.parse_event(
+      WebhookRequest.new(%{adapter_name: :teams, payload: activity})
+    )
   end
 
   defp channel_activity do

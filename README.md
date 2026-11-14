@@ -21,6 +21,8 @@ The spike includes these functions:
 - Render canonical date, number, and dynamic-select modal inputs for Teams dialogs.
 - Normalize Teams dynamic-search invokes and responses.
 - Parse message reaction and Adaptive Card invoke activities.
+- Parse message edits and restores as `:message_updated` events and deletions as
+  `:message_deleted` events.
 - Run deterministic protocol and security tests with no Microsoft account.
 - Run an optional live suite after you add credentials and a conversation reference.
 
@@ -141,9 +143,10 @@ opts = [
 - The bot token goes only to the Bot Connector hosts in `:allowed_service_hosts`.
   File downloads must use a host in `:allowed_file_hosts` (default: SharePoint).
   Other URLs return `{:error, :untrusted_media_url}` and send no request.
-- Teams sends no attachment size. Pass a positive integer in `:max_media_bytes` to
-  stop a download once it passes that size, with `{:error, :media_too_large}`.
-  Without it, the whole file is downloaded.
+- Teams sends no attachment size. Pass a positive integer in `:max_media_bytes`, or
+  call `Adapter.fetch_bounded_media(media, max_bytes, opts)`, to stop a download
+  once it passes that size, with `{:error, :media_too_large}`. Without a limit, the
+  whole file is downloaded.
 
 ## Adaptive Cards
 
