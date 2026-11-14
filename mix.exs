@@ -2,7 +2,7 @@ defmodule Jido.Chat.Teams.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @jido_chat_ref "0b6f16d9b91b37c61f2ad913dcdd4adea1713f88"
+  @jido_chat_ref "7652b6d74c4fc8170149ae1cfd08f981cfb1ea27"
   @source_url "https://github.com/agentjido/jido_chat_teams"
   @description "Microsoft Teams adapter package for Jido.Chat"
 
@@ -46,16 +46,7 @@ defmodule Jido.Chat.Teams.MixProject do
   defp elixirc_paths(_), do: ["lib"]
 
   defp chat_dependency do
-    case {Mix.env(), System.get_env("JIDO_CHAT_PATH")} do
-      {env, path} when env in [:dev, :test] and is_binary(path) and path != "" ->
-        {:jido_chat, path: Path.expand(path, __DIR__), override: true}
-
-      {env, _path} when env in [:dev, :test] ->
-        {:jido_chat, github: "agentjido/jido_chat", ref: @jido_chat_ref, override: true}
-
-      _ ->
-        {:jido_chat, "~> 3.0.0-dev"}
-    end
+    {:jido_chat, github: "agentjido/jido_chat", ref: @jido_chat_ref}
   end
 
   defp deps do
@@ -64,7 +55,7 @@ defmodule Jido.Chat.Teams.MixProject do
       {:req, "~> 0.7"},
       {:jason, "~> 1.4"},
       {:jose, "~> 1.11"},
-      {:dotenvy, "~> 1.1", only: [:test]},
+      {:dotenvy, "~> 1.2"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:doctor, "~> 0.21", only: [:dev, :test], runtime: false},
