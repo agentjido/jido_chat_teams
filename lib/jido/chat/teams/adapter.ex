@@ -11,25 +11,35 @@ defmodule Jido.Chat.Teams.Adapter do
   alias Jido.Chat.{
     ActionEvent,
     ChannelInfo,
+    ChannelRef,
     EventEnvelope,
     Incoming,
     Media,
+    Message,
+    MessageDeletedEvent,
+    MessageUpdatedEvent,
     OptionsLoadError,
     OptionsLoadEvent,
     OptionsLoadResult,
     PostPayload,
     ReactionEvent,
     Response,
+    Thread,
     WebhookRequest,
     WebhookResponse
   }
 
-  alias Jido.Chat.Teams.{CardRenderer, ConversationRef}
+  alias Jido.Chat.Teams.{Auth, CardRenderer, ConversationRef}
   alias Jido.Chat.Teams.Auth.JwtVerifier
   alias Jido.Chat.Teams.Transport.ReqClient
 
   @card_content_type "application/vnd.microsoft.card.adaptive"
   @default_options_timeout_ms 3_000
+  @message_event_types %{
+    "message" => :message,
+    "messageUpdate" => :message_updated,
+    "messageDelete" => :message_deleted
+  }
   @media_type_pattern ~r/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/
   @media_kind_extensions %{
     ".aac" => :audio,
@@ -185,6 +195,24 @@ defmodule Jido.Chat.Teams.Adapter do
 
   def transform_incoming(_payload), do: {:error, :invalid_activity}
 
+  @doc """
+  Checks the bot credentials by requesting a Bot Connector token, without sending
+  an activity. Returns Microsoft's `error_description` when it rejects them.
+  """
+  @spec verify_credentials(keyword()) :: :ok | {:error, term()}
+  def verify_credentials(opts \\ []) do
+    case Auth.fetch_token(opts) do
+      {:ok, _token} ->
+        :ok
+
+      {:error, {:oauth_error, _status, %{"error_description" => description}}} ->
+        {:error, description}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   @impl true
   def send_message(external_room_id, text, opts \\ []) when is_binary(text) do
     with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
@@ -297,6 +325,16 @@ defmodule Jido.Chat.Teams.Adapter do
     end
   end
 
+  @doc """
+  Downloads an inbound attachment but stops once it exceeds `max_bytes`, with
+  `{:error, :media_too_large}`. Teams sends no attachment size, so a caller
+  cannot check the size before downloading.
+  """
+  @spec fetch_bounded_media(term(), pos_integer(), keyword()) ::
+          {:ok, binary()} | {:error, term()}
+  def fetch_bounded_media(reference, max_bytes, opts \\ []),
+    do: fetch_media(reference, Keyword.put(opts, :max_media_bytes, max_bytes))
+
   @impl true
   def load_options(%OptionsLoadEvent{} = event, opts \\ []) do
     timeout_ms =
@@ -324,21 +362,8 @@ defmodule Jido.Chat.Teams.Adapter do
     payload = request.payload
 
     case {value(payload, :type), value(payload, :name)} do
-      {type, _name} when type in ["message", "messageUpdate", "messageDelete"] ->
-        with {:ok, incoming} <- transform_incoming(payload) do
-          {:ok,
-           EventEnvelope.new(%{
-             id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
-             adapter_name: :teams,
-             event_type: :message,
-             thread_id: incoming.external_thread_id,
-             channel_id: stringify(incoming.external_room_id),
-             message_id: stringify(incoming.external_message_id),
-             payload: incoming,
-             raw: normalize_struct(payload),
-             metadata: %{activity_type: type}
-           })}
-        end
+      {type, _name} when is_map_key(@message_event_types, type) ->
+        parse_message_event(payload, Map.fetch!(@message_event_types, type))
 
       {"messageReaction", _name} ->
         parse_reaction_event(payload)
@@ -759,6 +784,88 @@ defmodule Jido.Chat.Teams.Adapter do
     do: if(String.trim(value) == "", do: nil, else: value)
 
   defp blank_to_nil(_value), do: nil
+
+  defp parse_message_event(payload, event_type) do
+    with {:ok, incoming} <- transform_incoming(payload) do
+      {:ok,
+       EventEnvelope.new(%{
+         id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
+         adapter_name: :teams,
+         event_type: event_type,
+         thread_id: incoming.external_thread_id,
+         channel_id: stringify(incoming.external_room_id),
+         message_id: stringify(incoming.external_message_id),
+         payload: message_event_payload(event_type, incoming, payload),
+         raw: normalize_struct(payload),
+         metadata: %{activity_type: value(payload, :type)}
+       })}
+    end
+  end
+
+  defp message_event_payload(:message, incoming, _payload), do: incoming
+
+  defp message_event_payload(:message_updated, incoming, payload) do
+    message =
+      Message.from_incoming(incoming,
+        adapter_name: :teams,
+        thread_id: lifecycle_thread_id(incoming)
+      )
+
+    incoming
+    |> lifecycle_attrs(payload)
+    |> Map.put(:message, message)
+    |> MessageUpdatedEvent.new()
+  end
+
+  defp message_event_payload(:message_deleted, incoming, payload) do
+    incoming
+    |> lifecycle_attrs(payload)
+    |> MessageDeletedEvent.new()
+  end
+
+  defp lifecycle_attrs(incoming, payload) do
+    room_id = incoming.external_room_id
+    thread_id = lifecycle_thread_id(incoming)
+
+    %{
+      adapter: __MODULE__,
+      adapter_name: :teams,
+      thread_id: thread_id,
+      channel_id: stringify(room_id),
+      thread:
+        Thread.new(%{
+          id: thread_id,
+          adapter_name: :teams,
+          adapter: __MODULE__,
+          external_room_id: room_id,
+          external_thread_id: incoming.external_thread_id,
+          channel_id: "teams:#{room_id}",
+          is_dm: incoming.channel_meta.is_dm,
+          metadata: %{delivery_external_room_id: incoming.delivery_external_room_id}
+        }),
+      channel:
+        ChannelRef.new(%{
+          id: "teams:#{room_id}",
+          adapter_name: :teams,
+          adapter: __MODULE__,
+          external_id: room_id,
+          metadata: %{is_dm: incoming.channel_meta.is_dm}
+        }),
+      message_id: incoming.external_message_id,
+      author: incoming.author,
+      timestamp: incoming.timestamp,
+      raw: normalize_struct(payload),
+      metadata: %{
+        event_type: value(value(payload, :channelData) || %{}, :eventType),
+        channel_meta: incoming.channel_meta
+      }
+    }
+  end
+
+  defp lifecycle_thread_id(%Incoming{external_thread_id: nil, external_room_id: room_id}),
+    do: "teams:#{room_id}"
+
+  defp lifecycle_thread_id(%Incoming{external_thread_id: thread_id}), do: thread_id
 
   defp parse_reaction_event(payload) do
     added = value(payload, :reactionsAdded) |> List.wrap()
