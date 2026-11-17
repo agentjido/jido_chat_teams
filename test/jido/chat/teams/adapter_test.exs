@@ -1,669 +1,38 @@
 defmodule Jido.Chat.Teams.AdapterTest do
-  use ExUnit.Case, async: true
+  use Jido.Chat.AdapterTestKit, adapter: Jido.Chat.Teams.Adapter, async: true
 
-  alias Jido.Chat.{
-    ActionEvent,
-    ChannelRef,
-    Incoming,
-    Media,
-    MessageDeletedEvent,
-    MessageUpdatedEvent,
-    OptionsLoadError,
-    OptionsLoadEvent,
-    OptionsLoadResult,
-    PostPayload,
-    ReactionEvent,
-    Thread,
-    WebhookRequest
-  }
+  alias Jido.Chat
+  alias Jido.Chat.Adapter, as: ChatAdapter
+  alias Jido.Chat.Client
+  alias Jido.Chat.Teams
+  alias Jido.Chat.Teams.{Adapter, ConversationRef, Operations, TestTransport}
+  alias Jido.Chat.Teams.Transport.ReqClient
 
-  alias Jido.Chat.Teams.ConversationRef
+  defmodule OptionsLoader do
+    @moduledoc false
 
-  defmodule FakeTransport do
-    @behaviour Jido.Chat.Teams.Transport
-
-    @impl true
-    def send_activity(reference, activity, opts) do
-      send(opts[:test_pid], {:send_activity, reference, activity})
-      {:ok, %{"id" => "activity-sent"}}
-    end
-
-    @impl true
-    def reply_to_activity(reference, activity_id, activity, opts) do
-      send(opts[:test_pid], {:reply_to_activity, reference, activity_id, activity})
-      {:ok, %{"id" => "activity-reply"}}
-    end
-
-    @impl true
-    def update_activity(reference, activity_id, activity, opts) do
-      send(opts[:test_pid], {:update_activity, reference, activity_id, activity})
-      {:ok, %{"id" => activity_id}}
-    end
-
-    @impl true
-    def delete_activity(reference, activity_id, opts) do
-      send(opts[:test_pid], {:delete_activity, reference, activity_id})
-      {:ok, true}
-    end
-
-    @impl true
-    def download_media(url, opts) do
-      send(opts[:test_pid], {:download_media, url})
-      send(opts[:test_pid], {:download_limit, opts[:max_media_bytes]})
-      {:ok, "media-bytes"}
+    def load(data, opts, prefix) do
+      send(opts[:test_pid], {:mfa_loader, data["query"], prefix})
+      [{"MFA", "mfa"}]
     end
   end
 
-  defmodule TokenReq do
-    def request(_opts), do: Process.get(:token_response)
+  defp client(opts \\ []) do
+    Client.new!(Adapter,
+      id: "teams-#{System.unique_integer([:positive])}",
+      credentials:
+        Keyword.get(opts, :credentials, %{
+          app_id: "app-1",
+          app_password: "secret-1",
+          app_tenant_id: "tenant-1"
+        }),
+      config: [test_pid: self(), marker: :private],
+      transport: TestTransport
+    )
   end
 
-  defmodule NoMediaTransport do
-    @behaviour Jido.Chat.Teams.Transport
-
-    @impl true
-    def send_activity(_reference, _activity, _opts), do: {:ok, %{}}
-
-    @impl true
-    def reply_to_activity(_reference, _activity_id, _activity, _opts), do: {:ok, %{}}
-
-    @impl true
-    def update_activity(_reference, _activity_id, _activity, _opts), do: {:ok, %{}}
-
-    @impl true
-    def delete_activity(_reference, _activity_id, _opts), do: {:ok, true}
-  end
-
-  test "declares a valid Jido.Chat capability matrix" do
-    assert :ok = Jido.Chat.Adapter.validate_capabilities(Jido.Chat.Teams.Adapter)
-
-    capabilities = Jido.Chat.Teams.Adapter.capabilities()
-    assert capabilities.card_charts == :fallback
-    assert capabilities.card_tables == :native
-    assert capabilities.modal_date_input == :native
-    assert capabilities.modal_number_input == :fallback
-    assert capabilities.external_select == :native
-    assert capabilities.options_load == :native
-    assert capabilities.link_action_ids == :native
-    assert capabilities.fetch_media == :native
-  end
-
-  test "normalizes a channel message and preserves a delivery reference" do
-    assert {:ok, incoming} = Jido.Chat.Teams.Adapter.transform_incoming(channel_activity())
-
-    assert incoming.external_room_id == "channel-1"
-    assert incoming.external_user_id == "aad-user-1"
-    assert incoming.external_message_id == "activity-1"
-    assert incoming.external_thread_id == "19:thread@thread.tacv2"
-    assert incoming.chat_type == :channel
-    assert incoming.chat_title == "General"
-    assert incoming.text == "hello from Teams"
-    assert incoming.was_mentioned
-    assert [%{user_id: "28:bot", is_self: true}] = incoming.mentions
-
-    assert {:ok, reference} = ConversationRef.decode(incoming.delivery_external_room_id)
-    assert reference.conversation_id == "19:thread@thread.tacv2"
-    assert reference.service_url == "https://smba.trafficmanager.net/amer"
-    assert reference.tenant_id == "tenant-1"
-    assert reference.team_id == "team-1"
-    assert reference.channel_id == "channel-1"
-    assert reference.scope == :channel
-  end
-
-  test "normalizes a personal chat" do
-    activity =
-      channel_activity()
-      |> Map.put("conversation", %{"id" => "personal-1", "conversationType" => "personal"})
-      |> Map.put("channelData", %{"tenant" => %{"id" => "tenant-1"}})
-
-    assert {:ok, incoming} = Jido.Chat.Teams.Adapter.transform_incoming(activity)
-    assert incoming.external_room_id == "personal-1"
-    assert incoming.external_thread_id == nil
-    assert incoming.chat_type == :private
-    assert incoming.channel_meta.is_dm
-  end
-
-  test "normalizes attachments when contentType is missing" do
-    activity =
-      Map.put(channel_activity(), "attachments", [
-        %{
-          "contentType" => " APPLICATION/VND.MICROSOFT.CARD.ADAPTIVE ",
-          "content" => %{"type" => "AdaptiveCard"}
-        },
-        %{
-          "name" => "explicit.png",
-          "contentType" => "image/png",
-          "contentUrl" => "https://teams.example.test/files/explicit"
-        },
-        %{
-          "name" => "fallback.png",
-          "contentUrl" => "https://teams.example.test/files/fallback"
-        },
-        %{
-          "name" => "archive.unknown",
-          "contentType" => " ",
-          "contentUrl" => "https://teams.example.test/files/unknown"
-        },
-        %{
-          "name" => " ",
-          "contentUrl" => "https://teams.example.test/files/photo.PNG?token=signed"
-        },
-        %{
-          "name" => "misleading.png",
-          "contentType" => " application/pdf; charset=binary ",
-          "contentUrl" => "https://teams.example.test/files/misleading"
-        }
-      ])
-
-    assert {:ok, incoming} = Jido.Chat.Teams.Adapter.transform_incoming(activity)
-    assert [explicit, fallback, unknown, signed_url, misleading] = incoming.media
-
-    assert explicit.kind == :image
-    assert explicit.media_type == "image/png"
-
-    assert fallback.kind == :image
-    assert fallback.filename == "fallback.png"
-    assert fallback.media_type == nil
-
-    assert unknown.kind == :file
-    assert unknown.media_type == nil
-
-    assert signed_url.kind == :image
-    assert signed_url.filename == nil
-    assert signed_url.media_type == nil
-
-    assert misleading.kind == :file
-    assert misleading.media_type == "application/pdf"
-  end
-
-  describe "verify_credentials/1" do
-    @credentials [
-      req: TokenReq,
-      app_id: "app-1",
-      app_password: "secret",
-      app_tenant_id: "tenant-1"
-    ]
-
-    test "accepts credentials that obtain a token" do
-      Process.put(
-        :token_response,
-        {:ok, %Req.Response{status: 200, body: %{"access_token" => "token-1"}}}
-      )
-
-      assert :ok = Jido.Chat.Teams.Adapter.verify_credentials(@credentials)
-    end
-
-    test "returns Microsoft's description of rejected credentials" do
-      Process.put(
-        :token_response,
-        {:ok,
-         %Req.Response{
-           status: 401,
-           body: %{
-             "error" => "invalid_client",
-             "error_description" => "AADSTS7000215: Invalid client secret"
-           }
-         }}
-      )
-
-      assert {:error, "AADSTS7000215: Invalid client secret"} =
-               Jido.Chat.Teams.Adapter.verify_credentials(@credentials)
-    end
-
-    test "reports a missing credential" do
-      assert {:error, {:missing_credential, :app_id}} =
-               Jido.Chat.Teams.Adapter.verify_credentials(req: TokenReq, app_password: "secret")
-    end
-  end
-
-  test "rejects unsupported activity types" do
-    assert {:error, {:unsupported_activity_type, "conversationUpdate"}} =
-             Jido.Chat.Teams.Adapter.transform_incoming(%{"type" => "conversationUpdate"})
-  end
-
-  test "sends, replies, edits, deletes, and starts typing" do
-    reference = conversation_ref()
-    opts = [transport: FakeTransport, test_pid: self()]
-
-    assert {:ok, sent} = Jido.Chat.Teams.Adapter.send_message(reference, "hello", opts)
-    assert sent.external_message_id == "activity-sent"
-
-    assert_received {:send_activity, ^reference,
-                     %{"type" => "message", "text" => "hello", "textFormat" => "markdown"}}
-
-    assert {:ok, reply} =
-             Jido.Chat.Teams.Adapter.send_message(
-               ConversationRef.encode(reference),
-               "reply",
-               Keyword.put(opts, :reply_to_id, "parent-1")
-             )
-
-    assert reply.external_message_id == "activity-reply"
-
-    assert_received {:reply_to_activity, ^reference, "parent-1",
-                     %{"type" => "message", "text" => "reply", "textFormat" => "markdown"}}
-
-    assert {:ok, edited} =
-             Jido.Chat.Teams.Adapter.edit_message(reference, "activity-1", "edited", opts)
-
-    assert edited.external_message_id == "activity-1"
-    assert_received {:update_activity, ^reference, "activity-1", %{"text" => "edited"}}
-
-    assert :ok = Jido.Chat.Teams.Adapter.start_typing(reference, opts)
-    assert_received {:send_activity, ^reference, %{"type" => "typing"}}
-
-    assert :ok = Jido.Chat.Teams.Adapter.delete_message(reference, "activity-1", opts)
-    assert_received {:delete_activity, ^reference, "activity-1"}
-  end
-
-  test "posts a canonical card as an Adaptive Card" do
-    reference = conversation_ref()
-
-    payload =
-      PostPayload.new(%{
-        kind: :card,
-        text: "Build result",
-        card: %{
-          title: "Build result",
-          summary: "The build passed.",
-          components: [%{kind: :button, id: "details", label: "Details", value: "42"}]
-        }
-      })
-
-    assert {:ok, response} =
-             Jido.Chat.Teams.Adapter.post_message(reference, payload,
-               transport: FakeTransport,
-               test_pid: self()
-             )
-
-    assert response.external_message_id == "activity-sent"
-
-    assert_received {:send_activity, ^reference,
-                     %{
-                       "attachments" => [
-                         %{
-                           "contentType" => "application/vnd.microsoft.card.adaptive",
-                           "content" => %{
-                             "type" => "AdaptiveCard",
-                             "body" => [_title, _summary, %{"type" => "ActionSet"}]
-                           }
-                         }
-                       ]
-                     }}
-  end
-
-  test "parses reaction and invoke activities into Jido.Chat events" do
-    reaction_request =
-      WebhookRequest.new(%{
-        adapter_name: :teams,
-        payload: %{
-          "type" => "messageReaction",
-          "id" => "reaction-1",
-          "replyToId" => "activity-1",
-          "conversation" => %{"id" => "conversation-1"},
-          "from" => %{"id" => "user-1", "name" => "Alice"},
-          "reactionsAdded" => [%{"type" => "like"}]
-        }
-      })
-
-    assert {:ok, reaction_envelope} = Jido.Chat.Teams.Adapter.parse_event(reaction_request)
-
-    assert %ReactionEvent{emoji: "like", added: true, message_id: "activity-1"} =
-             reaction_envelope.payload
-
-    channel_reaction = %{
-      "type" => "messageReaction",
-      "id" => "reaction-2",
-      "replyToId" => "1575667808184",
-      "serviceUrl" => "https://smba.trafficmanager.net/amer/",
-      "conversation" => %{
-        "conversationType" => "channel",
-        "id" => "19:channel@thread.tacv2;messageid=1575667800000"
-      },
-      "channelData" => %{
-        "channel" => %{"id" => "19:channel@thread.tacv2"},
-        "team" => %{"id" => "19:team@thread.tacv2"},
-        "tenant" => %{"id" => "tenant-1"}
-      },
-      "from" => %{"id" => "29:user", "aadObjectId" => "aad-user-1"},
-      "reactionsAdded" => [%{"type" => "heart"}]
-    }
-
-    assert {:ok, channel_envelope} =
-             Jido.Chat.Teams.Adapter.parse_event(
-               WebhookRequest.new(%{adapter_name: :teams, payload: channel_reaction})
-             )
-
-    assert %{channel_id: "19:channel@thread.tacv2", message_id: "1575667808184"} =
-             channel_envelope
-
-    assert %ReactionEvent{
-             channel_id: "19:channel@thread.tacv2",
-             thread_id: "19:channel@thread.tacv2;messageid=1575667800000",
-             emoji: "heart",
-             user: %{user_id: "aad-user-1"}
-           } = channel_envelope.payload
-
-    invoke_request =
-      WebhookRequest.new(%{
-        adapter_name: :teams,
-        payload: %{
-          "type" => "invoke",
-          "id" => "invoke-1",
-          "name" => "adaptiveCard/action",
-          "conversation" => %{"id" => "conversation-1"},
-          "from" => %{"id" => "user-1", "name" => "Alice"},
-          "value" => %{"action" => %{"verb" => "approve", "value" => "42"}}
-        }
-      })
-
-    assert {:ok, action_envelope} = Jido.Chat.Teams.Adapter.parse_event(invoke_request)
-    assert %ActionEvent{action_id: "approve", value: "42"} = action_envelope.payload
-  end
-
-  test "parses a new message into a message event" do
-    assert {:ok, envelope} = parse_activity(channel_activity())
-
-    assert %{event_type: :message, channel_id: "channel-1", message_id: "activity-1"} = envelope
-    assert %Incoming{text: "hello from Teams"} = envelope.payload
-  end
-
-  test "parses edited and restored messages into message-updated events" do
-    for event_type <- ["editMessage", "undeleteMessage"] do
-      activity =
-        channel_activity()
-        |> Map.put("type", "messageUpdate")
-        |> Map.put("text", "<at>Jido</at> hello again")
-        |> put_in(["channelData", "eventType"], event_type)
-
-      assert {:ok, envelope} = parse_activity(activity)
-
-      assert %{
-               event_type: :message_updated,
-               channel_id: "channel-1",
-               thread_id: "19:thread@thread.tacv2",
-               message_id: "activity-1"
-             } = envelope
-
-      assert %MessageUpdatedEvent{
-               adapter_name: :teams,
-               channel_id: "channel-1",
-               thread_id: "19:thread@thread.tacv2",
-               message_id: "activity-1",
-               author: %{user_id: "aad-user-1"},
-               timestamp: "2026-08-19T12:00:00Z",
-               message: %{text: "hello again", external_message_id: "activity-1"},
-               metadata: %{event_type: ^event_type}
-             } = envelope.payload
-    end
-  end
-
-  test "parses a deleted message into a message-deleted event without content" do
-    activity =
-      channel_activity()
-      |> Map.put("type", "messageDelete")
-      |> Map.delete("text")
-      |> Map.delete("entities")
-      |> put_in(["channelData", "eventType"], "softDeleteMessage")
-
-    assert {:ok, envelope} = parse_activity(activity)
-
-    assert %{event_type: :message_deleted, channel_id: "channel-1", message_id: "activity-1"} =
-             envelope
-
-    assert %MessageDeletedEvent{
-             channel_id: "channel-1",
-             message_id: "activity-1",
-             author: %{user_id: "aad-user-1"},
-             message: nil,
-             metadata: %{event_type: "softDeleteMessage"}
-           } = envelope.payload
-  end
-
-  test "gives lifecycle handlers the thread and channel of the message" do
-    chat =
-      Jido.Chat.new(adapters: %{teams: Jido.Chat.Teams.Adapter})
-      |> Jido.Chat.on_message_updated(&send(self(), {:lifecycle, &1}))
-      |> Jido.Chat.on_message_deleted(&send(self(), {:lifecycle, &1}))
-
-    channel_edit =
-      channel_activity()
-      |> Map.put("type", "messageUpdate")
-      |> put_in(["channelData", "eventType"], "editMessage")
-
-    personal_delete =
-      channel_activity()
-      |> Map.put("type", "messageDelete")
-      |> Map.put("conversation", %{"id" => "personal-1", "conversationType" => "personal"})
-      |> Map.put("channelData", %{
-        "tenant" => %{"id" => "tenant-1"},
-        "eventType" => "softDeleteMessage"
-      })
-      |> Map.delete("text")
-      |> Map.delete("entities")
-
-    for activity <- [channel_edit, personal_delete] do
-      assert {:ok, envelope} = parse_activity(activity)
-      assert {:ok, _chat, _event} = Jido.Chat.process_event(chat, :teams, envelope, [])
-    end
-
-    assert_received {:lifecycle, %MessageUpdatedEvent{} = edited}
-    assert edited.thread_id == "19:thread@thread.tacv2"
-    assert edited.message.thread_id == edited.thread_id
-
-    assert %Thread{
-             id: "19:thread@thread.tacv2",
-             external_room_id: "channel-1",
-             external_thread_id: "19:thread@thread.tacv2",
-             adapter: Jido.Chat.Teams.Adapter,
-             is_dm: false,
-             metadata: %{delivery_external_room_id: "teamsref:v1:" <> _}
-           } = edited.thread
-
-    assert %ChannelRef{
-             id: "teams:channel-1",
-             external_id: "channel-1",
-             metadata: %{is_dm: false}
-           } = edited.channel
-
-    assert_received {:lifecycle, %MessageDeletedEvent{} = deleted}
-    assert deleted.thread_id == "teams:personal-1"
-
-    assert %Thread{
-             id: "teams:personal-1",
-             external_room_id: "personal-1",
-             external_thread_id: nil,
-             is_dm: true
-           } = deleted.thread
-
-    assert %ChannelRef{
-             id: "teams:personal-1",
-             external_id: "personal-1",
-             metadata: %{is_dm: true}
-           } = deleted.channel
-  end
-
-  test "parses Teams dynamic-search invokes into normalized options-load events" do
-    request =
-      WebhookRequest.new(%{
-        adapter_name: :teams,
-        payload: %{
-          "type" => "invoke",
-          "name" => "application/search",
-          "id" => "invoke-search-1",
-          "replyToId" => "activity-1",
-          "conversation" => %{"id" => "conversation-1"},
-          "from" => %{"id" => "user-1", "name" => "Alice"},
-          "value" => %{
-            "dataset" => "assignee",
-            "queryText" => "ad",
-            "queryOptions" => %{"top" => 12, "skip" => 3},
-            "timeoutMs" => 750,
-            "data" => %{"team" => "core"}
-          }
-        }
-      })
-
-    assert {:ok, envelope} = Jido.Chat.Teams.Adapter.parse_event(request)
-    assert envelope.event_type == :options_load
-
-    assert %OptionsLoadEvent{
-             action_id: "assignee",
-             query: "ad",
-             limit: 12,
-             timeout_ms: 750,
-             channel_id: "conversation-1",
-             message_id: "activity-1"
-           } = envelope.payload
-
-    assert envelope.payload.metadata == %{associated_inputs: %{"team" => "core"}, skip: 3}
-
-    malformed = put_in(request.payload["value"], %{"queryText" => "ad"})
-    assert {:error, :missing_options_dataset} = Jido.Chat.Teams.Adapter.parse_event(malformed)
-  end
-
-  test "loads and formats dynamic options with Teams limits" do
-    event = OptionsLoadEvent.new(%{action_id: "assignee", query: "ad", timeout_ms: 500})
-
-    loader = fn ^event, _opts ->
-      {:ok, %{options: [%{label: "Ada", value: "user:ada"}]}}
-    end
-
-    assert {:ok, %OptionsLoadResult{} = result} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: loader)
-
-    assert {:ok, %OptionsLoadResult{}} =
-             Jido.Chat.Adapter.load_options(Jido.Chat.Teams.Adapter, event,
-               options_loader: loader
-             )
-
-    response = Jido.Chat.Teams.Adapter.format_options_load_response({:ok, result})
-    assert response.status == 200
-
-    assert response.body == %{
-             "type" => "application/vnd.microsoft.search.searchResponse",
-             "value" => %{
-               "results" => [%{"title" => "Ada", "value" => "user:ada"}]
-             }
-           }
-
-    oversized_loader = fn _event, _opts ->
-      {:ok,
-       %{
-         options: for(index <- 1..16, do: %{label: "Option #{index}", value: "value:#{index}"})
-       }}
-    end
-
-    assert {:error, %OptionsLoadError{code: "teams_option_limit", retryable: false}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: oversized_loader)
-  end
-
-  test "normalizes missing loaders, groups, loader errors, and timeouts" do
-    event = OptionsLoadEvent.new(%{action_id: "assignee", timeout_ms: 500})
-
-    assert {:error, %OptionsLoadError{code: "options_loader_unavailable"}} =
-             Jido.Chat.Teams.Adapter.load_options(event)
-
-    group_loader = fn _event, _opts ->
-      {:ok,
-       %{
-         option_groups: [
-           %{label: "Teams", options: [%{label: "Core", value: "team:core"}]}
-         ]
-       }}
-    end
-
-    assert {:error, %OptionsLoadError{code: "teams_option_groups_unsupported"}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: group_loader)
-
-    error_loader = fn _event, _opts -> {:error, :upstream_unavailable} end
-
-    assert {:error, %OptionsLoadError{code: "options_loader_error"}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: error_loader)
-
-    crashing_loader = fn _event, _opts -> raise "upstream crashed" end
-
-    assert {:error, %OptionsLoadError{code: "options_loader_error"}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: crashing_loader)
-
-    explicit_timeout_loader = fn _event, _opts -> {:error, :timeout} end
-
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 20}} =
-             Jido.Chat.Teams.Adapter.load_options(event,
-               options_loader: explicit_timeout_loader,
-               timeout_ms: 20
-             )
-
-    timeout_loader = fn _event, _opts ->
-      Process.sleep(100)
-      {:ok, %{options: []}}
-    end
-
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 20}} =
-             Jido.Chat.Teams.Adapter.load_options(event,
-               options_loader: timeout_loader,
-               timeout_ms: 20
-             )
-  end
-
-  test "uses standard, adapter, event, and default options timeout precedence" do
-    timeout_loader = fn _event, _opts -> {:error, :timeout} end
-    event = OptionsLoadEvent.new(%{action_id: "assignee", timeout_ms: 30})
-
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 10}} =
-             Jido.Chat.Teams.Adapter.load_options(event,
-               options_loader: timeout_loader,
-               timeout_ms: 10,
-               options_timeout_ms: 20
-             )
-
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 20}} =
-             Jido.Chat.Teams.Adapter.load_options(event,
-               options_loader: timeout_loader,
-               options_timeout_ms: 20
-             )
-
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 30}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: timeout_loader)
-
-    event_without_timeout = OptionsLoadEvent.new(%{action_id: "assignee"})
-
-    assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 3_000}} =
-             Jido.Chat.Teams.Adapter.load_options(event_without_timeout,
-               options_loader: timeout_loader
-             )
-  end
-
-  test "returns a typed timeout when the options loader exceeds the selected timeout" do
-    event = OptionsLoadEvent.new(%{action_id: "assignee", timeout_ms: 100})
-
-    timeout_loader = fn _event, _opts ->
-      Process.sleep(100)
-      {:ok, %{options: []}}
-    end
-
-    assert {:error,
-            %OptionsLoadError{
-              kind: :timeout,
-              code: "options_load_timeout",
-              retryable: true,
-              timeout_ms: 10
-            }} =
-             Jido.Chat.Teams.Adapter.load_options(event,
-               options_loader: timeout_loader,
-               timeout_ms: 10
-             )
-  end
-
-  test "uses an injected webhook verifier" do
-    request = WebhookRequest.new(%{adapter_name: :teams, payload: channel_activity()})
-    verifier = fn ^request, _opts -> :ok end
-
-    assert :ok = Jido.Chat.Teams.Adapter.verify_webhook(request, verifier: verifier)
-  end
-
-  defp conversation_ref do
-    ConversationRef.new(%{
+  defp room_id do
+    ConversationRef.encode(%{
       conversation_id: "19:thread@thread.tacv2",
       service_url: "https://smba.trafficmanager.net/amer",
       tenant_id: "tenant-1",
@@ -673,138 +42,200 @@ defmodule Jido.Chat.Teams.AdapterTest do
     })
   end
 
-  describe "inbound media" do
-    @image_url "https://smba.trafficmanager.net/amer/v3/attachments/0-abc/views/original"
-    @download_url "https://contoso-my.sharepoint.com/personal/ada/_layouts/15/download.aspx?tempauth=x"
-    @file_page_url "https://contoso-my.sharepoint.com/personal/ada/Documents/report.pdf"
+  test "client discovery is local and credentials stay private" do
+    value = client()
 
-    test "reports the downloadUrl of a personal-chat file as its media url" do
-      file = %{
-        "contentType" => "application/vnd.microsoft.teams.file.download.info",
-        "contentUrl" => @file_page_url,
-        "name" => "report.pdf",
-        "content" => %{"downloadUrl" => @download_url, "uniqueId" => "file-1"}
-      }
-
-      assert {:ok, incoming} =
-               Jido.Chat.Teams.Adapter.transform_incoming(personal_activity([file]))
-
-      assert [media] = incoming.media
-      assert media.url == @download_url
-      assert media.filename == "report.pdf"
-      assert media.metadata.content_url == @file_page_url
-    end
-
-    test "keeps the contentUrl of a pasted image" do
-      image = %{"contentType" => "image/png", "contentUrl" => @image_url}
-
-      assert {:ok, incoming} =
-               Jido.Chat.Teams.Adapter.transform_incoming(personal_activity([image]))
-
-      assert [%{kind: :image, url: @image_url}] = incoming.media
-    end
-
-    test "fetches a URL reference through the transport" do
-      assert {:ok, "media-bytes"} =
-               Jido.Chat.Teams.Adapter.fetch_media(@image_url, media_opts())
-
-      assert_received {:download_media, @image_url}
-    end
-
-    test "passes the byte limit of a bounded fetch to the transport" do
-      assert {:ok, "media-bytes"} =
-               Jido.Chat.Teams.Adapter.fetch_bounded_media(@image_url, 1_024, media_opts())
-
-      assert_received {:download_media, @image_url}
-      assert_received {:download_limit, 1_024}
-
-      assert {:ok, "media-bytes"} = Jido.Chat.Teams.Adapter.fetch_media(@image_url, media_opts())
-      assert_received {:download_limit, nil}
-    end
-
-    test "prefers the downloadUrl of a Media struct or a string-keyed map" do
-      media = %Media{
-        kind: :file,
-        url: @file_page_url,
-        metadata: %{content: %{"downloadUrl" => @download_url}}
-      }
-
-      map = %{
-        "url" => @file_page_url,
-        "metadata" => %{"content" => %{"downloadUrl" => @download_url}}
-      }
-
-      assert {:ok, _bytes} = Jido.Chat.Teams.Adapter.fetch_media(media, media_opts())
-      assert_received {:download_media, @download_url}
-      assert {:ok, _bytes} = Jido.Chat.Teams.Adapter.fetch_media(map, media_opts())
-      assert_received {:download_media, @download_url}
-    end
-
-    test "uses the url of a Media struct without a downloadUrl" do
-      media = %Media{kind: :image, url: @image_url}
-
-      assert {:ok, _bytes} = Jido.Chat.Teams.Adapter.fetch_media(media, media_opts())
-      assert_received {:download_media, @image_url}
-    end
-
-    for reference <- [nil, "  ", %{}, %Media{url: nil}] do
-      test "rejects the media reference #{inspect(reference)}" do
-        assert {:error, :invalid_media_reference} =
-                 Jido.Chat.Teams.Adapter.fetch_media(
-                   unquote(Macro.escape(reference)),
-                   media_opts()
-                 )
-
-        refute_received {:download_media, _url}
-      end
-    end
-
-    test "reports a transport without media downloads as unsupported" do
-      assert {:error, :unsupported} =
-               Jido.Chat.Teams.Adapter.fetch_media(@image_url, transport: NoMediaTransport)
-    end
+    assert Adapter.default_transport() == ReqClient
+    assert Teams.adapter() == Adapter
+    assert Teams.webhook() == Teams.Webhook
+    assert :ok = ChatAdapter.validate_capabilities(Adapter)
+    refute inspect(value) =~ "secret-1"
   end
 
-  defp media_opts, do: [transport: FakeTransport, test_pid: self()]
+  test "message, reply, stream, edit, delete, and typing use explicit credentials" do
+    value = client()
+    room_id = room_id()
 
-  defp personal_activity(attachments) do
-    channel_activity()
-    |> Map.put("conversation", %{"id" => "personal-1", "conversationType" => "personal"})
-    |> Map.put("channelData", %{"tenant" => %{"id" => "tenant-1"}})
-    |> Map.put("attachments", attachments)
+    assert {:ok, sent} =
+             Chat.send_text(value, room_id, "hello",
+               keyboard: %{
+                 "rows" => [
+                   [
+                     %{"text" => "Approve", "value" => "approve"},
+                     %{"text" => "Docs", "url" => "https://example.test/docs"}
+                   ]
+                 ]
+               }
+             )
+
+    assert sent.data["result"]["id"] == "activity-sent"
+
+    assert_receive {:send_activity, credentials, reference, activity, private}
+    assert credentials.app_id == "app-1"
+    assert reference.conversation_id == "19:thread@thread.tacv2"
+    assert activity["text"] == "hello"
+    assert activity["textFormat"] == "markdown"
+    assert [%{"content" => %{"actions" => [submit, link]}}] = activity["attachments"]
+    assert submit["type"] == "Action.Submit"
+    assert link["type"] == "Action.OpenUrl"
+    assert private[:marker] == :private
+    refute Keyword.has_key?(private, :app_password)
+
+    assert {:ok, _} = Chat.send_text(value, room_id, "reply", reply_to_id: "activity-0")
+    assert_receive {:reply_to_activity, _, ^reference, "activity-0", %{"text" => "reply"}, _}
+
+    assert {:ok, _} = Chat.stream_text(value, room_id, ["a", "b"])
+    assert_receive {:send_activity, _, ^reference, %{"text" => "ab"}, _}
+
+    assert {:ok, _} = Chat.edit_message(value, room_id, "activity-1", "updated")
+    assert_receive {:update_activity, _, ^reference, "activity-1", %{"text" => "updated"}, _}
+
+    assert {:ok, deleted} = Chat.delete_message(value, room_id, "activity-1")
+    assert deleted.data["result"] == %{"acknowledged" => true}
+    assert_receive {:delete_activity, _, ^reference, "activity-1", _}
+
+    assert {:ok, typed} = Chat.start_typing(value, room_id)
+    assert typed.data["result"] == %{"acknowledged" => true}
+    assert_receive {:send_activity, _, ^reference, %{"type" => "typing"}, _}
   end
 
-  defp parse_activity(activity) do
-    Jido.Chat.Teams.Adapter.parse_event(
-      WebhookRequest.new(%{adapter_name: :teams, payload: activity})
-    )
+  test "local metadata, thread, subject, and options need no provider credentials" do
+    value = client(credentials: %{})
+    room_id = room_id()
+
+    assert {:ok, metadata} = Chat.fetch_metadata(value, room_id)
+
+    assert metadata.data["result"] == %{
+             "id" => room_id,
+             "kind" => "channel",
+             "name" => "channel-1"
+           }
+
+    thread = operation_request(value, :fetch_thread, %{"room_id" => room_id})
+    assert {:ok, thread_result} = Chat.execute(value, thread)
+    assert thread_result.data["result"]["delivery_room_ref"] == "19:thread@thread.tacv2"
+
+    subject = operation_request(value, :fetch_subject, %{"room_id" => room_id})
+    assert {:ok, subject_result} = Chat.execute(value, subject)
+    assert subject_result.data["result"]["kind"] == "conversation"
+
+    options = operation_request(value, :load_options)
+
+    assert {:ok, options_result} =
+             Chat.execute(value, options,
+               options: [
+                 options_loader: fn _ ->
+                   [%{label: "Ada", value: "user:ada"}, {"Grace", "user:grace"}]
+                 end
+               ]
+             )
+
+    assert options_result.data["result"] == %{
+             "options" => [
+               %{"label" => "Ada", "value" => "user:ada"},
+               %{"label" => "Grace", "value" => "user:grace"}
+             ],
+             "complete" => true
+           }
+
+    assert {:ok, mfa_result} =
+             Chat.execute(value, options,
+               options: [options_loader: {OptionsLoader, :load, ["prefix"]}]
+             )
+
+    assert mfa_result.data["result"]["options"] == [
+             %{"label" => "MFA", "value" => "mfa"}
+           ]
+
+    assert_receive {:mfa_loader, "a", "prefix"}
+
+    assert {:ok, atom_map_result} =
+             Chat.execute(value, options,
+               options: [
+                 options_loader: fn _ ->
+                   {:ok, %{options: [%{label: "Atom", value: "atom"}], complete: false}}
+                 end
+               ]
+             )
+
+    assert atom_map_result.data["result"] == %{
+             "options" => [%{"label" => "Atom", "value" => "atom"}],
+             "complete" => false
+           }
   end
 
-  defp channel_activity do
-    %{
-      "type" => "message",
-      "id" => "activity-1",
-      "timestamp" => "2026-08-19T12:00:00Z",
-      "serviceUrl" => "https://smba.trafficmanager.net/amer/",
-      "conversation" => %{
-        "id" => "19:thread@thread.tacv2",
-        "conversationType" => "channel"
-      },
-      "from" => %{"id" => "29:user", "aadObjectId" => "aad-user-1", "name" => "Alice"},
-      "recipient" => %{"id" => "28:bot", "name" => "Jido"},
-      "text" => "<at>Jido</at> hello from Teams",
-      "entities" => [
-        %{
-          "type" => "mention",
-          "mentioned" => %{"id" => "28:bot", "name" => "Jido"},
-          "text" => "<at>Jido</at>"
-        }
-      ],
-      "channelData" => %{
-        "tenant" => %{"id" => "tenant-1"},
-        "team" => %{"id" => "team-1", "name" => "Jido"},
-        "channel" => %{"id" => "channel-1", "name" => "General"}
-      }
+  test "options loading is bounded and leaves no late result in the caller mailbox" do
+    value = client(credentials: %{})
+    request = operation_request(value, :load_options)
+    test_pid = self()
+
+    loader = fn _ ->
+      send(test_pid, {:loader_started, self()})
+      receive do: (:release -> [%{"label" => "Late", "value" => "late"}])
+    end
+
+    assert {:error, :options_timeout} =
+             Operations.invoke(:load_options, value, request,
+               options_loader: loader,
+               options_timeout_ms: 5
+             )
+
+    assert_receive {:loader_started, loader_pid}
+    monitor = Process.monitor(loader_pid)
+    assert_receive {:DOWN, ^monitor, :process, ^loader_pid, _}
+    refute_receive {_reference, _value}
+
+    assert {:error, :invalid_options_timeout} =
+             Operations.invoke(:load_options, value, request,
+               options_loader: fn _ -> [] end,
+               options_timeout_ms: -1
+             )
+  end
+
+  test "client-scoped media downloads return canonical base64 content" do
+    value = client()
+
+    reference = %{
+      "client_id" => value.id,
+      "kind" => "media",
+      "id" => "https://smba.trafficmanager.net/amer/v3/attachments/1"
     }
+
+    assert {:ok, result} = Chat.download_file(value, reference)
+    assert result.data["result"]["content_base64"] == Base.encode64("media-bytes")
+    assert_receive {:download_media, credentials, reference_url, _}
+    assert credentials.app_password == "secret-1"
+    assert reference_url == reference["id"]
+
+    wrong_client = Map.put(reference, "client_id", "another-client")
+    assert {:error, _} = Chat.download_file(value, wrong_client)
+    refute_receive {:download_media, _, _, _}
+
+    signed = Map.put(reference, "id", reference["id"] <> "?token=private")
+    assert {:error, _} = Chat.download_file(value, signed)
+    refute_receive {:download_media, _, _, _}
+  end
+
+  test "string-key credentials work and unsupported operations do not attempt provider I/O" do
+    value = client(credentials: %{"app_id" => "app-1", "app_password" => "secret-1"})
+
+    assert {:ok, _} = Chat.send_text(value, room_id(), "hello")
+    assert_receive {:send_activity, %{"app_id" => "app-1"}, _, _, _}
+
+    no_credentials = client(credentials: %{})
+    request = operation_request(no_credentials, :send_message, %{"room_id" => room_id()})
+
+    assert {:error, {:not_attempted, :missing_app_credentials}} =
+             Operations.invoke(:send_message, no_credentials, request, [])
+
+    assert {:error, {:not_attempted, :unsupported}} =
+             Operations.invoke(:send_file, no_credentials, request, [])
+
+    refute_receive {:send_activity, _, _, _, _}
+  end
+
+  test "HTML is an explicit unsupported format" do
+    assert {:error, _} = Chat.send_text(client(), room_id(), "hello", format: :html)
+    refute_receive {:send_activity, _, _, _, _}
   end
 end

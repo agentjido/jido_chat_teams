@@ -2,7 +2,6 @@ defmodule Jido.Chat.Teams.Auth.JwtVerifierTest do
   use ExUnit.Case, async: true
 
   alias Jido.Chat.Teams.Auth.JwtVerifier
-  alias Jido.Chat.WebhookRequest
 
   @app_id "00000000-0000-0000-0000-000000000001"
   @service_url "https://smba.trafficmanager.net/amer/"
@@ -17,57 +16,53 @@ defmodule Jido.Chat.Teams.Auth.JwtVerifierTest do
   end
 
   test "accepts a valid Bot Connector token", ctx do
-    request = request(token(ctx.private_key, valid_claims()))
+    token = token(ctx.private_key, valid_claims())
 
     assert {:ok, claims} =
-             JwtVerifier.verify_with_claims(request,
-               app_id: @app_id,
+             JwtVerifier.verify_with_claims(
+               payload(),
+               %{"authorization" => "Bearer #{token}"},
+               %{app_id: @app_id, app_password: "private"},
                jwks: ctx.jwks,
                now: @now
              )
 
     assert claims["aud"] == @app_id
-    assert claims["serviceurl"] == @service_url
   end
 
-  test "rejects a wrong audience", ctx do
-    claims = Map.put(valid_claims(), "aud", "another-app")
+  test "rejects a wrong audience, service URL, and expired token", ctx do
+    cases = [
+      {Map.put(valid_claims(), "aud", "another-app"), :invalid_audience},
+      {Map.put(valid_claims(), "serviceurl", "https://smba.trafficmanager.net/emea/"),
+       :service_url_mismatch},
+      {Map.put(valid_claims(), "exp", @now - 301), :expired_token}
+    ]
 
-    assert {:error, :invalid_audience} =
-             JwtVerifier.verify(request(token(ctx.private_key, claims)),
-               app_id: @app_id,
-               jwks: ctx.jwks,
-               now: @now
-             )
+    for {claims, reason} <- cases do
+      token = token(ctx.private_key, claims)
+
+      assert {:error, ^reason} =
+               JwtVerifier.verify(
+                 payload(),
+                 [{"Authorization", "Bearer #{token}"}],
+                 %{"app_id" => @app_id},
+                 jwks: ctx.jwks,
+                 now: @now
+               )
+    end
   end
 
-  test "rejects a service URL mismatch", ctx do
-    claims = Map.put(valid_claims(), "serviceurl", "https://smba.trafficmanager.net/emea/")
-
-    assert {:error, :service_url_mismatch} =
-             JwtVerifier.verify(request(token(ctx.private_key, claims)),
-               app_id: @app_id,
-               jwks: ctx.jwks,
-               now: @now
-             )
-  end
-
-  test "rejects an expired token", ctx do
-    claims = Map.put(valid_claims(), "exp", @now - 301)
-
-    assert {:error, :expired_token} =
-             JwtVerifier.verify(request(token(ctx.private_key, claims)),
-               app_id: @app_id,
-               jwks: ctx.jwks,
-               now: @now
-             )
-  end
-
-  test "rejects a request with no authorization header", ctx do
-    request = WebhookRequest.new(%{payload: %{"serviceUrl" => @service_url}})
-
+  test "rejects missing authorization and missing explicit app identity", ctx do
     assert {:error, :missing_authorization} =
-             JwtVerifier.verify(request, app_id: @app_id, jwks: ctx.jwks, now: @now)
+             JwtVerifier.verify(payload(), %{}, %{app_id: @app_id}, jwks: ctx.jwks, now: @now)
+
+    token = token(ctx.private_key, valid_claims())
+
+    assert {:error, {:missing_credential, :app_id}} =
+             JwtVerifier.verify(payload(), %{"authorization" => "Bearer #{token}"}, %{},
+               jwks: ctx.jwks,
+               now: @now
+             )
   end
 
   defp valid_claims do
@@ -87,11 +82,5 @@ defmodule Jido.Chat.Teams.Auth.JwtVerifierTest do
     |> elem(1)
   end
 
-  defp request(token) do
-    WebhookRequest.new(%{
-      adapter_name: :teams,
-      headers: %{"authorization" => "Bearer #{token}"},
-      payload: %{"serviceUrl" => @service_url}
-    })
-  end
+  defp payload, do: %{"serviceUrl" => @service_url}
 end

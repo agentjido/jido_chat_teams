@@ -18,7 +18,9 @@
 - Treat the Activity Protocol as the primary message path.
 - Keep Microsoft Graph optional and do not use Graph as the primary send path.
 - Validate a Bot Connector JWT before trusting its `serviceUrl`.
-- Preserve the adapter boundary. Runtime routing, retries, and persistence belong in `jido_messaging`.
+- Preserve the adapter boundary. Managed runtime and persistence belong in Jido Chat core.
+- Use immutable clients, request Signals, and deterministic incoming fact Signals.
+- Do not restore V2 event wrappers or direct adapter send APIs.
 
 ## Release Hygiene
 

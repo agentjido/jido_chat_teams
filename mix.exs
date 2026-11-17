@@ -35,6 +35,7 @@ defmodule Jido.Chat.Teams.MixProject do
         q: :test,
         cover: :test,
         coveralls: :test,
+        "test.contracts": :test,
         "coveralls.github": :test,
         "coveralls.html": :test
       ]
@@ -46,11 +47,10 @@ defmodule Jido.Chat.Teams.MixProject do
 
   defp deps do
     [
-      {:jido_chat, "~> 1.2 and >= 1.2.1"},
+      {:jido_chat, path: "../jido_chat"},
       {:req, "~> 0.7"},
       {:jason, "~> 1.4"},
       {:jose, "~> 1.11"},
-      {:dotenvy, "~> 1.1", only: [:test]},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:doctor, "~> 0.21", only: [:dev, :test], runtime: false},
@@ -67,6 +67,9 @@ defmodule Jido.Chat.Teams.MixProject do
       install_hooks: ["git_hooks.install"],
       q: ["quality"],
       cover: ["coveralls"],
+      "test.contracts": [
+        "test test/jido/chat/teams/adapter_test.exs test/jido/chat/teams/webhook_test.exs"
+      ],
       quality: [
         "format --check-formatted",
         "compile --warnings-as-errors",
@@ -78,7 +81,7 @@ defmodule Jido.Chat.Teams.MixProject do
 
   defp package do
     [
-      files: ["lib", "appPackage", "mix.exs", "README.md", "LICENSE", "usage-rules.md"],
+      files: ["lib", "appPackage", "mix.exs", "README.md", "LICENSE", "usage-rules.md", "docs"],
       maintainers: ["Mike Hostetler"],
       licenses: ["Apache-2.0"],
       links: %{
@@ -95,7 +98,7 @@ defmodule Jido.Chat.Teams.MixProject do
       main: "readme",
       source_ref: "v#{@version}",
       source_url: @source_url,
-      extras: ["README.md", "usage-rules.md"]
+      extras: ["README.md", "usage-rules.md", "docs/architecture.md", "docs/validation.md"]
     ]
   end
 end

@@ -5,7 +5,7 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
 
   @behaviour Jido.Chat.Teams.Transport
 
-  alias Jido.Chat.Teams.Auth.TokenCache
+  alias Jido.Chat.Teams.Auth
   alias Jido.Chat.Teams.ConversationRef
 
   @default_service_hosts [
@@ -22,8 +22,9 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   @max_media_redirects 3
 
   @impl true
-  def send_activity(%ConversationRef{} = reference, activity, opts) do
+  def send_activity(credentials, %ConversationRef{} = reference, activity, opts) do
     request(
+      credentials,
       :post,
       activity_url(reference),
       activity,
@@ -33,8 +34,9 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   end
 
   @impl true
-  def reply_to_activity(%ConversationRef{} = reference, activity_id, activity, opts) do
+  def reply_to_activity(credentials, %ConversationRef{} = reference, activity_id, activity, opts) do
     request(
+      credentials,
       :post,
       activity_url(reference, activity_id),
       activity,
@@ -44,8 +46,9 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   end
 
   @impl true
-  def update_activity(%ConversationRef{} = reference, activity_id, activity, opts) do
+  def update_activity(credentials, %ConversationRef{} = reference, activity_id, activity, opts) do
     request(
+      credentials,
       :put,
       activity_url(reference, activity_id),
       activity,
@@ -55,8 +58,9 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   end
 
   @impl true
-  def delete_activity(%ConversationRef{} = reference, activity_id, opts) do
+  def delete_activity(credentials, %ConversationRef{} = reference, activity_id, opts) do
     request(
+      credentials,
       :delete,
       activity_url(reference, activity_id),
       nil,
@@ -75,19 +79,19 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   downloaded.
   """
   @impl true
-  def download_media(url, opts) when is_binary(url) do
+  def download_media(credentials, url, opts) when is_map(credentials) and is_binary(url) do
     with {:ok, max_bytes} <- max_media_bytes(opts) do
-      download_media(url, opts, max_bytes, @max_media_redirects)
+      download_media(credentials, url, opts, max_bytes, @max_media_redirects)
     end
   end
 
-  defp download_media(url, opts, max_bytes, redirects_left) do
+  defp download_media(credentials, url, opts, max_bytes, redirects_left) do
     case media_auth(url, opts) do
       {:ok, :bot_token} ->
-        download_with_token(url, opts, true, max_bytes, redirects_left)
+        download_with_token(credentials, url, opts, true, max_bytes, redirects_left)
 
       {:ok, :pre_authenticated} ->
-        download(url, nil, opts, false, max_bytes, redirects_left)
+        download(credentials, url, nil, opts, false, max_bytes, redirects_left)
 
       {:error, _reason} = error ->
         error
@@ -109,7 +113,7 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   defp service_hosts(opts), do: Keyword.get(opts, :allowed_service_hosts, @default_service_hosts)
   defp file_hosts(opts), do: Keyword.get(opts, :allowed_file_hosts, @default_file_hosts)
 
-  defp download(url, token, opts, retry_auth?, max_bytes, redirects_left) do
+  defp download(credentials, url, token, opts, retry_auth?, max_bytes, redirects_left) do
     req = Keyword.get(opts, :req, Req)
 
     request_opts =
@@ -131,10 +135,10 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
 
       {:ok, %Req.Response{status: status} = response}
       when status in @media_redirect_statuses ->
-        follow_media_redirect(response, url, opts, max_bytes, redirects_left)
+        follow_media_redirect(credentials, response, url, opts, max_bytes, redirects_left)
 
       {:ok, %Req.Response{status: 401}} ->
-        retry_unauthorized(url, opts, retry_auth?, max_bytes, redirects_left)
+        retry_unauthorized(credentials, url, opts, retry_auth?, max_bytes, redirects_left)
 
       {:ok, %Req.Response{status: 429} = response} ->
         {:error, {:rate_limited, retry_after_ms(response)}}
@@ -147,14 +151,14 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
     end
   end
 
-  defp follow_media_redirect(_response, _url, _opts, _max_bytes, 0),
+  defp follow_media_redirect(_credentials, _response, _url, _opts, _max_bytes, 0),
     do: {:error, :too_many_redirects}
 
-  defp follow_media_redirect(response, url, opts, max_bytes, redirects_left) do
+  defp follow_media_redirect(credentials, response, url, opts, max_bytes, redirects_left) do
     with [location | _rest] when is_binary(location) and location != "" <-
            Req.Response.get_header(response, "location"),
          {:ok, redirect_url} <- resolve_redirect_url(url, location) do
-      download_media(redirect_url, opts, max_bytes, redirects_left - 1)
+      download_media(credentials, redirect_url, opts, max_bytes, redirects_left - 1)
     else
       _other -> {:error, :invalid_media_redirect}
     end
@@ -172,18 +176,17 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
 
   defp media_body(_response, _max_bytes), do: {:error, :invalid_media_body}
 
-  defp retry_unauthorized(url, opts, retry_auth?, max_bytes, redirects_left) do
+  defp retry_unauthorized(credentials, url, opts, retry_auth?, max_bytes, redirects_left) do
     if retry_auth? and is_nil(Keyword.get(opts, :access_token)) do
-      TokenCache.invalidate(opts)
-      download_with_token(url, opts, false, max_bytes, redirects_left)
+      download_with_token(credentials, url, opts, false, max_bytes, redirects_left)
     else
       {:error, {:http_error, 401}}
     end
   end
 
-  defp download_with_token(url, opts, retry_auth?, max_bytes, redirects_left) do
-    with {:ok, token} <- TokenCache.fetch(opts) do
-      download(url, token, opts, retry_auth?, max_bytes, redirects_left)
+  defp download_with_token(credentials, url, opts, retry_auth?, max_bytes, redirects_left) do
+    with {:ok, token} <- access_token(credentials, opts) do
+      download(credentials, url, token, opts, retry_auth?, max_bytes, redirects_left)
     end
   end
 
@@ -226,14 +229,14 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
     end
   end
 
-  defp request(method, url, body, reference, opts) do
+  defp request(credentials, method, url, body, reference, opts) do
     with :ok <- validate_service_url(reference.service_url, opts),
-         {:ok, token} <- TokenCache.fetch(opts) do
-      do_request(method, url, body, token, opts, true)
+         {:ok, token} <- access_token(credentials, opts) do
+      do_request(credentials, method, url, body, token, opts, true)
     end
   end
 
-  defp do_request(method, url, body, token, opts, retry_auth?) do
+  defp do_request(credentials, method, url, body, token, opts, retry_auth?) do
     req = Keyword.get(opts, :req, Req)
 
     request_opts =
@@ -246,35 +249,76 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
       ]
       |> maybe_put_json(body)
 
-    case req.request(request_opts) do
-      {:ok, %Req.Response{status: status}} when status in 200..299 and method == :delete ->
-        {:ok, true}
+    context = %{
+      credentials: credentials,
+      method: method,
+      url: url,
+      body: body,
+      opts: opts,
+      retry_auth?: retry_auth?
+    }
 
-      {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
-        {:ok, normalize_body(body)}
+    req.request(request_opts) |> handle_activity_response(context)
+  end
 
-      {:ok, %Req.Response{status: 401, body: response_body}} ->
-        if retry_auth? and is_nil(Keyword.get(opts, :access_token)) do
-          TokenCache.invalidate(opts)
+  defp handle_activity_response(
+         {:ok, %Req.Response{status: status}},
+         %{method: :delete}
+       )
+       when status in 200..299,
+       do: {:ok, true}
 
-          with {:ok, next_token} <- TokenCache.fetch(opts) do
-            do_request(method, url, body, next_token, opts, false)
-          end
-        else
-          {:error, {:http_error, 401, response_body}}
-        end
+  defp handle_activity_response({:ok, %Req.Response{status: status, body: body}}, _context)
+       when status in 200..299,
+       do: {:ok, normalize_body(body)}
 
-      {:ok, %Req.Response{status: 429} = response} ->
-        {:error, {:rate_limited, retry_after_ms(response)}}
+  defp handle_activity_response(
+         {:ok, %Req.Response{status: 401, body: response_body}},
+         context
+       ),
+       do: retry_activity_auth(context, response_body)
 
-      {:ok, %Req.Response{status: status}} when status in [412, 502, 503, 504] ->
-        {:error, {:http_error, status}}
+  defp handle_activity_response({:ok, %Req.Response{status: 429} = response}, _context),
+    do: {:error, {:rate_limited, retry_after_ms(response)}}
 
-      {:ok, %Req.Response{status: status, body: response_body}} ->
-        {:error, {:http_error, status, response_body}}
+  defp handle_activity_response({:ok, %Req.Response{status: status}}, _context)
+       when status in [412, 502, 503, 504],
+       do: {:error, {:http_error, status}}
 
-      {:error, reason} ->
-        {:error, reason}
+  defp handle_activity_response(
+         {:ok, %Req.Response{status: status, body: response_body}},
+         _context
+       ),
+       do: {:error, {:http_error, status, response_body}}
+
+  defp handle_activity_response({:error, reason}, _context), do: {:error, reason}
+
+  defp retry_activity_auth(context, response_body) do
+    if context.retry_auth? and is_nil(Keyword.get(context.opts, :access_token)) do
+      retry_activity_with_fresh_token(context)
+    else
+      {:error, {:http_error, 401, response_body}}
+    end
+  end
+
+  defp retry_activity_with_fresh_token(context) do
+    with {:ok, next_token} <- access_token(context.credentials, context.opts) do
+      do_request(
+        context.credentials,
+        context.method,
+        context.url,
+        context.body,
+        next_token,
+        context.opts,
+        false
+      )
+    end
+  end
+
+  defp access_token(credentials, opts) do
+    case opts[:access_token] do
+      token when is_binary(token) and token != "" -> {:ok, token}
+      _ -> with {:ok, token} <- Auth.fetch_token(credentials, opts), do: {:ok, token.access_token}
     end
   end
 

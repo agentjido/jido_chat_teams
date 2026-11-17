@@ -1,224 +1,146 @@
 # Jido Chat Teams
 
-`jido_chat_teams` is an early Microsoft Teams adapter for the `Jido.Chat` ecosystem.
-It uses the Microsoft Bot Connector Activity Protocol. It does not require a Node.js
-or .NET sidecar.
+`jido_chat_teams` is the Microsoft Teams adapter for Jido Chat V3. It uses the
+Microsoft Bot Connector Activity Protocol. It does not need a Node.js or .NET
+sidecar.
 
-This package is a spike. Its public API can change before the first stable release.
+## V3 local integration
 
-## Spike scope
+This worktree uses the sibling `../jido_chat` package. Select a released Hex
+constraint only during later release work.
 
-The spike includes these functions:
-
-- Receive channel, group chat, and personal chat activities.
-- Verify inbound Bot Connector JWTs.
-- Remove the bot mention from inbound text.
-- Preserve a versioned conversation delivery reference.
-- Send, reply to, edit, and delete text messages.
-- Send typing activities.
-- Render `Jido.Chat.Card` data as Adaptive Cards.
-- Render native pie, bar, and line charts, native tables, and readable fallbacks.
-- Render canonical date, number, and dynamic-select modal inputs for Teams dialogs.
-- Normalize Teams dynamic-search invokes and responses.
-- Parse message reaction and Adaptive Card invoke activities.
-- Parse message edits and restores as `:message_updated` events and deletions as
-  `:message_deleted` events.
-- Run deterministic protocol and security tests with no Microsoft account.
-- Run an optional live suite after you add credentials and a conversation reference.
-
-The spike does not include files in channels/groups, Graph history, proactive conversation creation,
-ephemeral messages, or opening modal windows without an invoke activity. Reaction
-activities are parsed, but the adapter does not add or remove reactions. Microsoft
-Graph is not in the normal send path.
-
-## Install
-
-Add the package to the dependencies in your Mix project:
+The adapter is stateless. A `Jido.Chat.Client` holds private credentials and
+transport settings. Client construction starts no process and makes no request.
 
 ```elixir
-def deps do
-  [
-    {:jido_chat_teams, "~> 0.1.0"}
-  ]
-end
-```
-
-For local development in this workspace, use this path dependency:
-
-```elixir
-{:jido_chat_teams, path: "../jido_chat_teams"}
-```
-
-## Receive an activity
-
-Your HTTPS endpoint must pass the request headers and decoded JSON activity to the
-adapter. Verify the request before you parse it.
-
-```elixir
-alias Jido.Chat.Teams.Adapter
-alias Jido.Chat.WebhookRequest
-
-request =
-  WebhookRequest.new(%{
-    adapter_name: :teams,
-    headers: request_headers,
-    payload: activity,
-    raw: raw_body
-  })
-
-with :ok <- Adapter.verify_webhook(request, app_id: microsoft_app_id),
-     {:ok, event} <- Adapter.parse_event(request) do
-  {:ok, event}
-end
-```
-
-JWT verification checks the signature, algorithm, issuer, audience, time claims,
-and exact `serviceUrl`. The adapter gets current signing keys from Microsoft and
-caches them. You can inject `:jwks`, `:now`, and `:req` in deterministic tests.
-
-Do not accept a `serviceUrl` from an unverified activity. The outbound transport
-also limits service URLs to known Microsoft service hosts by default.
-
-## Send an activity
-
-A reply after the webhook request needs the conversation ID and the verified
-service URL. The adapter puts both values in `Incoming.delivery_external_room_id`
-as a versioned `teamsref:v1:` value. Store and use this value for outbound delivery.
-It has route data, but it has no secret.
-
-```elixir
-opts = [
-  app_id: System.fetch_env!("MICROSOFT_APP_ID"),
-  app_password: System.fetch_env!("MICROSOFT_APP_PASSWORD")
-]
-
-{:ok, response} =
-  Jido.Chat.Teams.Adapter.send_message(delivery_external_room_id, "Hello from Jido", opts)
-```
-
-You can also put the credentials in a `:credentials` map. This shape works with
-`Jido.Messaging.BridgeConfig`:
-
-```elixir
-credentials = %{
-  app_id: System.fetch_env!("MICROSOFT_APP_ID"),
-  app_password: System.fetch_env!("MICROSOFT_APP_PASSWORD")
-}
-```
-
-The token cache gets a Bot Connector access token when it is necessary. You can
-pass `access_token: "..."` for a short test.
-
-A single-tenant bot also needs its Microsoft Entra tenant. Add `app_tenant_id`
-with the tenant GUID or domain, such as `contoso.onmicrosoft.com`. The adapter then
-gets tokens from that tenant's endpoint. Without `app_tenant_id`, it uses the
-multi-tenant `botframework.com` endpoint. An explicit `token_url` overrides both.
-
-```elixir
-opts = [
-  app_id: System.fetch_env!("MICROSOFT_APP_ID"),
-  app_password: System.fetch_env!("MICROSOFT_APP_PASSWORD"),
-  app_tenant_id: System.fetch_env!("MICROSOFT_APP_TENANT_ID")
-]
-```
-
-## Receive attachments
-
-`Incoming.media` lists the attachments of an inbound message. Download one with
-`Adapter.fetch_media/2`. It accepts the `Jido.Chat.Media` item, a media map, or a URL:
-
-```elixir
-{:ok, bytes} = Jido.Chat.Teams.Adapter.fetch_media(media, opts)
-```
-
-| Attachment | Where | How the adapter reads it |
-| --- | --- | --- |
-| Pasted image | Personal chat, group chat, channel | Bot Connector URL with the bot token |
-| File | Personal chat | Pre-authenticated `content.downloadUrl`, no token |
-| File | Group chat, channel | Not supported. It needs Microsoft Graph. |
-
-- For a personal-chat file, `Media.url` is the `downloadUrl` and
-  `metadata.content_url` is the OneDrive page. The `downloadUrl` is valid for only
-  a few minutes. Fetch the file soon after the message arrives.
-- The bot token goes only to the Bot Connector hosts in `:allowed_service_hosts`.
-  File downloads must use a host in `:allowed_file_hosts` (default: SharePoint).
-  Other URLs return `{:error, :untrusted_media_url}` and send no request.
-- Teams sends no attachment size. Pass a positive integer in `:max_media_bytes`, or
-  call `Adapter.fetch_bounded_media(media, max_bytes, opts)`, to stop a download
-  once it passes that size, with `{:error, :media_too_large}`. Without a limit, the
-  whole file is downloaded.
-
-## Adaptive Cards
-
-Use a canonical `Jido.Chat.PostPayload` with `kind: :card`:
-
-```elixir
-payload =
-  Jido.Chat.PostPayload.new(%{
-    kind: :card,
-    text: "Build result",
-    card: %{
-      title: "Build result",
-      summary: "The build passed.",
-      components: [
-        %{kind: :button, id: "details", label: "Details", value: "42"}
-      ]
+client =
+  Jido.Chat.Client.new!(Jido.Chat.Teams.Adapter,
+    id: "teams/support",
+    credentials: %{
+      app_id: System.fetch_env!("MICROSOFT_APP_ID"),
+      app_password: System.fetch_env!("MICROSOFT_APP_PASSWORD"),
+      app_tenant_id: System.get_env("MICROSOFT_APP_TENANT_ID")
     }
-  })
-
-Jido.Chat.Teams.Adapter.post_message(delivery_external_room_id, payload, opts)
+  )
 ```
 
-The adapter also accepts a raw Adaptive Card map with `"type" => "AdaptiveCard"`.
+The optional tenant ID selects a single-tenant OAuth endpoint. Without it, the
+transport uses the multi-tenant Bot Framework endpoint. The package does not
+read application environment values. It does not keep a bearer-token cache.
 
-Teams renders pie, bar, and line charts as native Adaptive Card chart elements.
-Area charts use the canonical text fallback because Teams has no area chart element.
-Tables render one page and include a row-count note when more rows exist. Link actions
-keep their canonical stable IDs in the Adaptive Card payload.
+## Agent connection
 
-## Modal cards and dynamic options
-
-`Jido.Chat.Teams.ModalRenderer.render/1` converts a canonical `Jido.Chat.Modal` into
-an Adaptive Card for a Teams dialog response. Date inputs are native. Number inputs
-are native unless they use `step`, which Teams cannot enforce. Dynamic selects use
-Teams `Data.Query` typeahead controls. Opening a dialog still needs a verified invoke
-activity, so `Adapter.open_modal/3` remains unsupported.
-
-Teams sends a dynamic query as an `application/search` invoke. `Adapter.parse_event/2`
-normalizes it to `Jido.Chat.OptionsLoadEvent`. Configure an option loader when you
-process the event:
+Use `Jido.Chat.Plugin` in the Agent and add the Teams connection to its `chat`
+block. Environment references resolve when the Agent starts.
 
 ```elixir
-loader = fn event, _opts ->
-  {:ok, %{options: [%{label: "Ada", value: "user:ada"}]}}
+connection :teams do
+  client Jido.Chat.Teams.Adapter,
+    id: "teams/support",
+    credentials: %{
+      app_id: env("MICROSOFT_APP_ID"),
+      app_password: env("MICROSOFT_APP_PASSWORD"),
+      app_tenant_id: env("MICROSOFT_APP_TENANT_ID")
+    }
+
+  commands [Jido.Chat.SendMessage]
 end
-
-{:ok, result} =
-  Jido.Chat.Teams.Adapter.load_options(event,
-    options_loader: loader
-  )
-
-response = Jido.Chat.Teams.Adapter.format_options_load_response({:ok, result})
 ```
 
-The loader can be a function of arity one or two, or an MFA tuple. The adapter
-enforces the Teams maximum of 15 dynamic options. Teams dynamic-search responses do
-not support option groups, so the adapter returns a typed error for them. The event
-timeout, loader errors, and provider-limit errors remain typed.
+Jido Chat core owns the Agent integration, authorization, managed rooms,
+durable declarations, membership, history, and storage. This package owns only
+Teams protocol behavior.
+
+## Receive an Activity
+
+The host owns the HTTPS endpoint and response deadline. Verify the request
+before you normalize its Activity.
+
+```elixir
+with :ok <-
+       Jido.Chat.Teams.Webhook.verify(client, activity, request_headers),
+     {:ok, delivery} <- Jido.Chat.normalize(client, activity) do
+  MyApp.accept(delivery.signals)
+end
+```
+
+JWT verification checks the signature, algorithm, issuer, audience, time
+claims, and exact `serviceUrl`. The verifier caches public Microsoft signing
+keys. You can inject `:jwks`, `:now`, and `:req` in offline tests.
+
+Do not accept a `serviceUrl` from an unverified Activity. The outbound
+transport also restricts service URLs to known Microsoft hosts by default.
+
+## Send an Activity
+
+A later reply needs the conversation ID and the verified service URL. Incoming
+message facts put both values in a versioned `teamsref:v1:` room ID. Store that
+room ID with the message or room record.
+
+```elixir
+{:ok, completed} =
+  Jido.Chat.send_text(client, teams_room_id, "Hello from Jido")
+
+message_id = completed.data["result"]["id"]
+
+{:ok, _} =
+  Jido.Chat.send_text(client, teams_room_id, "A reply",
+    reply_to_id: message_id
+  )
+```
+
+The adapter also supports finite text streams, edits, deletes, typing notices,
+conversation metadata, thread references, conversation subjects, media
+downloads, and dynamic options. `Jido.Chat.capabilities/1` returns the exact
+native and unsupported matrix.
+
+## Media
+
+Incoming facts expose only client-scoped media references for Bot Connector
+attachments that have a safe URL. They do not expose pre-authenticated
+`downloadUrl` values, OneDrive page references, or URLs with query credentials.
+Download a reference through the same client:
+
+```elixir
+{:ok, completed} = Jido.Chat.download_file(client, media["resource_ref"])
+bytes = Base.decode64!(completed.data["result"]["content_base64"])
+```
+
+Bot Connector attachment URLs get the bot bearer token only on trusted service
+hosts. Pre-authenticated SharePoint URLs get no bearer token. Each redirect is
+checked again. Set `max_media_bytes` in client config or execution options to
+stop a large download.
+
+## Adaptive Cards and options
+
+The send API maps a canonical keyboard to Adaptive Card actions:
+
+```elixir
+keyboard = %{
+  "rows" => [
+    [
+      %{"text" => "Approve", "value" => "approve"},
+      %{"text" => "Docs", "url" => "https://example.com/docs"}
+    ]
+  ]
+}
+
+Jido.Chat.send_text(client, teams_room_id, "Review this", keyboard: keyboard)
+```
+
+`Jido.Chat.Teams.CardRenderer` and `Jido.Chat.Teams.ModalRenderer` remain public
+pure renderers for the richer Adaptive Card features. An `application/search`
+invoke normalizes to `jido.chat.options.requested`. Execute a `LoadOptions`
+request with a private loader, then pass its result to
+`Jido.Chat.Teams.Webhook.response/1`.
 
 ## Microsoft app setup
 
 The [`appPackage/manifest.json`](appPackage/manifest.json) file is a development
-template. Before you make the app package:
+template. Replace its app identifiers, add the two required icons, set the
+Azure Bot messaging endpoint, and install the app in a test tenant.
 
-1. Replace `${TEAMS_APP_ID}` with the Teams app ID.
-2. Replace `${MICROSOFT_APP_ID}` with the Microsoft Entra application ID.
-3. Add valid `appPackage/color.png` and `appPackage/outline.png` icon files.
-4. Set the Azure Bot messaging endpoint to your public HTTPS activity endpoint.
-5. Add the app to the test tenant and team.
-6. Send one message to the bot and capture the verified inbound conversation data.
-
-Make the test conversation reference from that verified activity:
+Create a room reference only from a verified Activity:
 
 ```elixir
 reference =
@@ -231,47 +153,34 @@ reference =
     channel_id: activity["channelData"]["channel"]["id"]
   })
 
-IO.puts(Jido.Chat.Teams.ConversationRef.encode(reference))
+teams_room_id = Jido.Chat.Teams.ConversationRef.encode(reference)
 ```
 
-## Tests
+## Validation
 
-The normal suite has no live network calls:
+Default checks do not call Microsoft:
 
-```shell
+```sh
+mix deps.get
+mix format --check-formatted
+mix compile --warnings-as-errors
 mix test
+mix test.contracts
 mix quality
+mix coveralls
 ```
 
-The live suite is disabled by default. Copy `.env.example` to `.env.test`, and set:
+The optional live test requires a dedicated test conversation and explicit
+environment credentials:
 
-```text
-RUN_LIVE_TEAMS_TESTS=true
-MICROSOFT_APP_ID=...
-MICROSOFT_APP_PASSWORD=...
-TEAMS_TEST_CONVERSATION_REF=teamsref:v1:...
-TEAMS_TEST_REPLY_TO_ID=...
+```sh
+RUN_LIVE_TEAMS_TESTS=true \
+MICROSOFT_APP_ID=... \
+MICROSOFT_APP_PASSWORD=... \
+TEAMS_TEST_CONVERSATION_REF=teamsref:v1:... \
+mix test test/jido/chat/teams/live_integration_test.exs --include live
 ```
 
-`TEAMS_TEST_REPLY_TO_ID` is optional. Set `MICROSOFT_APP_TENANT_ID` too when the
-test bot is single-tenant. Run the live suite with this command:
-
-```shell
-mix test --include live test/jido/chat/team/live_integration_test.exs
-```
-
-The suite sends visible messages to the selected test conversation. It edits and
-deletes the test data. Use a dedicated tenant, team, and channel.
-
-## Known limits
-
-- A bot normally receives channel messages only when users mention it. Broader
-  access needs the applicable Teams permissions and tenant consent.
-- Private and shared channels have Microsoft platform limits. Test these scopes
-  separately before you use them in production.
-- The adapter returns `{:error, {:rate_limited, milliseconds}}` for HTTP 429. The
-  caller must wait for this interval before it tries again.
-- Long work must return an HTTP success response quickly and do later delivery with
-  the stored conversation reference.
-- Teams dynamic typeahead controls return at most 15 options and do not return option
-  groups.
+The live test sends, edits, and deletes visible messages. It is excluded by
+default. See [architecture](docs/architecture.md) and
+[validation](docs/validation.md).

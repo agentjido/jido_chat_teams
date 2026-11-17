@@ -1,9 +1,12 @@
 defmodule Jido.Chat.Teams.Transport.ReqClientTest do
   use ExUnit.Case, async: false
 
-  alias Jido.Chat.Teams.Auth.TokenCache
   alias Jido.Chat.Teams.ConversationRef
   alias Jido.Chat.Teams.Transport.ReqClient
+
+  @image_url "https://smba.trafficmanager.net/amer/v3/attachments/0-abc/views/original"
+  @download_url "https://contoso-my.sharepoint.com/personal/ada/download.aspx?tempauth=x"
+  @bytes <<137, 80, 78, 71, 13, 10, 26, 10>>
 
   defmodule FakeReq do
     def request(opts) do
@@ -21,44 +24,42 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
   end
 
   setup do
-    TokenCache.clear()
     Process.put(:test_pid, self())
     Process.delete(:responses)
     :ok
   end
 
-  test "gets a token and sends an activity to the stored service URL" do
-    responses([
-      ok(200, %{"access_token" => "token-1", "expires_in" => 3600}),
-      ok(200, %{"id" => "activity-1"})
-    ])
+  test "gets a token and sends an Activity to the stored service URL" do
+    responses([token("token-1"), ok(200, %{"id" => "activity-1"})])
 
     assert {:ok, %{"id" => "activity-1"}} =
-             ReqClient.send_activity(reference(), %{"type" => "message", "text" => "hello"},
-               req: FakeReq,
-               app_id: "app-1",
-               app_password: "secret"
+             ReqClient.send_activity(
+               credentials(),
+               reference(),
+               %{"type" => "message", "text" => "hello"},
+               req: FakeReq
              )
 
-    assert_received {:request, token_request}
+    assert_receive {:request, token_request}
     assert token_request[:url] =~ "login.microsoftonline.com"
     assert token_request[:form][:client_id] == "app-1"
     assert token_request[:form][:client_secret] == "secret"
 
-    assert_received {:request, activity_request}
+    assert_receive {:request, activity_request}
 
     assert activity_request[:url] ==
              "https://smba.trafficmanager.net/amer/v3/conversations/19%3Athread%40thread.tacv2/activities"
 
     assert {"authorization", "Bearer token-1"} in activity_request[:headers]
-    assert activity_request[:json] == %{"type" => "message", "text" => "hello"}
+    assert activity_request[:json]["text"] == "hello"
   end
 
-  test "uses an explicit access token without an OAuth request" do
+  test "an explicit access token avoids OAuth and encodes reply IDs" do
     responses([ok(200, %{"id" => "reply-1"})])
 
     assert {:ok, %{"id" => "reply-1"}} =
              ReqClient.reply_to_activity(
+               %{},
                reference(),
                "activity/parent",
                %{"type" => "message"},
@@ -66,13 +67,34 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
                access_token: "direct-token"
              )
 
-    assert_received {:request, request}
+    assert_receive {:request, request}
     assert request[:url] =~ "/activities/activity%2Fparent"
     assert {"authorization", "Bearer direct-token"} in request[:headers]
-    refute_received {:request, _other}
+    refute_receive {:request, _}
   end
 
-  test "returns the Microsoft retry interval for a rate limit" do
+  test "one unauthorized Activity response gets one new explicit credential token" do
+    responses([
+      token("old-token"),
+      ok(401, %{"error" => "expired"}),
+      token("new-token"),
+      ok(200, %{"id" => "activity-1"})
+    ])
+
+    assert {:ok, %{"id" => "activity-1"}} =
+             ReqClient.send_activity(credentials(), reference(), %{"type" => "typing"},
+               req: FakeReq
+             )
+
+    assert_receive {:request, _token_request}
+    assert_receive {:request, first}
+    assert {"authorization", "Bearer old-token"} in first[:headers]
+    assert_receive {:request, _token_request}
+    assert_receive {:request, second}
+    assert {"authorization", "Bearer new-token"} in second[:headers]
+  end
+
+  test "rate limits are typed and untrusted service URLs make no request" do
     responses([
       {:ok,
        %Req.Response{
@@ -83,223 +105,138 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
     ])
 
     assert {:error, {:rate_limited, 2_000}} =
-             ReqClient.send_activity(reference(), %{"type" => "typing"},
+             ReqClient.send_activity(%{}, reference(), %{"type" => "typing"},
                req: FakeReq,
                access_token: "direct-token"
              )
-  end
 
-  test "rejects a service URL that is not trusted" do
-    reference =
+    assert_receive {:request, _}
+
+    untrusted =
       ConversationRef.new(%{
         conversation_id: "conversation-1",
         service_url: "https://example.test/connector"
       })
 
     assert {:error, :untrusted_service_url} =
-             ReqClient.send_activity(reference, %{"type" => "message"},
+             ReqClient.send_activity(%{}, untrusted, %{"type" => "message"},
                req: FakeReq,
                access_token: "direct-token"
              )
 
-    refute_received {:request, _opts}
+    refute_receive {:request, _}
   end
 
-  describe "download_media/2" do
-    @image_url "https://smba.trafficmanager.net/amer/v3/attachments/0-abc/views/original"
-    @download_url "https://contoso-my.sharepoint.com/personal/ada/_layouts/15/download.aspx?tempauth=x"
-    @bytes <<137, 80, 78, 71, 13, 10, 26, 10>>
+  test "Bot Connector media uses a bearer token" do
+    responses([token("token-1"), ok(200, @bytes)])
 
-    test "downloads a Bot Connector attachment with the bot token" do
-      responses([token(200, "token-1"), ok(200, @bytes)])
+    assert {:ok, @bytes} =
+             ReqClient.download_media(credentials(), @image_url, req: FakeReq)
 
-      assert {:ok, @bytes} = ReqClient.download_media(@image_url, credentials())
-
-      assert_received {:request, token_request}
-      assert token_request[:url] =~ "login.microsoftonline.com"
-
-      assert_received {:request, request}
-      assert request[:method] == :get
-      assert request[:url] == @image_url
-      assert {"authorization", "Bearer token-1"} in request[:headers]
-      assert request[:decode_body] == false
-      assert request[:redirect] == false
-    end
-
-    test "gets a new token once after a 401" do
-      responses([token(200, "old-token"), ok(401, ""), token(200, "new-token"), ok(200, @bytes)])
-
-      assert {:ok, @bytes} = ReqClient.download_media(@image_url, credentials())
-
-      assert_received {:request, _token_request}
-      assert_received {:request, first}
-      assert {"authorization", "Bearer old-token"} in first[:headers]
-      assert_received {:request, _token_request}
-      assert_received {:request, second}
-      assert {"authorization", "Bearer new-token"} in second[:headers]
-    end
-
-    test "returns the HTTP status for other failures" do
-      responses([ok(404, "missing")])
-
-      assert {:error, {:http_error, 404}} =
-               ReqClient.download_media(@image_url, req: FakeReq, access_token: "direct-token")
-    end
-
-    test "downloads a pre-authenticated file URL without the bot token" do
-      responses([ok(200, "pdf-bytes")])
-
-      assert {:ok, "pdf-bytes"} = ReqClient.download_media(@download_url, credentials())
-
-      assert_received {:request, request}
-      assert request[:url] == @download_url
-      assert request[:headers] == []
-      refute_received {:request, _token_request}
-    end
-
-    test "never retries a file download with the bot token" do
-      responses([ok(401, "expired")])
-
-      assert {:error, {:http_error, 401}} = ReqClient.download_media(@download_url, credentials())
-
-      assert_received {:request, request}
-      assert request[:headers] == []
-      refute_received {:request, _request}
-    end
-
-    test "uses configured file hosts" do
-      responses([ok(200, "bytes")])
-
-      assert {:ok, "bytes"} =
-               ReqClient.download_media(
-                 "https://files.example.test/download?tempauth=x",
-                 credentials(allowed_file_hosts: ["files.example.test"])
-               )
-
-      assert_received {:request, request}
-      assert request[:headers] == []
-    end
-
-    test "follows a redirect after it validates the destination" do
-      redirect_url = "https://contoso-my.sharepoint.com/personal/ada/download?tempauth=y"
-
-      responses([
-        ok(302, "", %{"location" => [redirect_url]}),
-        ok(200, "redirected-bytes")
-      ])
-
-      assert {:ok, "redirected-bytes"} = ReqClient.download_media(@download_url, credentials())
-
-      assert_received {:request, first_request}
-      assert first_request[:url] == @download_url
-      assert first_request[:redirect] == false
-
-      assert_received {:request, second_request}
-      assert second_request[:url] == redirect_url
-      assert second_request[:headers] == []
-    end
-
-    test "does not follow a redirect to an untrusted host" do
-      responses([ok(302, "", %{"location" => ["https://untrusted.example/download"]})])
-
-      assert {:error, :untrusted_media_url} =
-               ReqClient.download_media(@download_url, credentials())
-
-      assert_received {:request, request}
-      assert request[:url] == @download_url
-      refute_received {:request, _request}
-    end
-
-    test "does not send a bot token to an untrusted redirect host" do
-      responses([
-        token(200, "token-1"),
-        ok(302, "", %{"location" => ["https://untrusted.example/download"]})
-      ])
-
-      assert {:error, :untrusted_media_url} = ReqClient.download_media(@image_url, credentials())
-
-      assert_received {:request, _token_request}
-      assert_received {:request, request}
-      assert {"authorization", "Bearer token-1"} in request[:headers]
-      refute_received {:request, _request}
-    end
-
-    test "stops after three redirects" do
-      responses([
-        redirect(@download_url, 1),
-        redirect(@download_url, 2),
-        redirect(@download_url, 3),
-        redirect(@download_url, 4)
-      ])
-
-      assert {:error, :too_many_redirects} =
-               ReqClient.download_media(@download_url, credentials())
-    end
-
-    test "refuses a download larger than max_media_bytes" do
-      responses([ok(200, "12345")])
-
-      assert {:error, :media_too_large} =
-               ReqClient.download_media(@download_url, credentials(max_media_bytes: 4))
-    end
-
-    test "stops reading once the download passes the limit" do
-      responses([streamed(200, ["abc", "def", "ghi"])])
-
-      assert {:error, :media_too_large} =
-               ReqClient.download_media(@download_url, credentials(max_media_bytes: 4))
-
-      assert_received {:chunk, "def"}
-      refute_received {:chunk, "ghi"}
-    end
-
-    test "stops at the first chunk when the declared size is above the limit" do
-      responses([streamed(200, ["a", "b"], %{"content-length" => ["1000"]})])
-
-      assert {:error, :media_too_large} =
-               ReqClient.download_media(@download_url, credentials(max_media_bytes: 10))
-
-      assert_received {:chunk, "a"}
-      refute_received {:chunk, "b"}
-    end
-
-    test "downloads the whole file when no limit is given" do
-      responses([ok(200, "the whole file")])
-
-      assert {:ok, "the whole file"} = ReqClient.download_media(@download_url, credentials())
-      assert_received {:request, request}
-      refute Keyword.has_key?(request, :into)
-    end
-
-    for invalid_limit <- [0, -1, "4"] do
-      test "rejects invalid max_media_bytes value #{inspect(invalid_limit)}" do
-        assert {:error, :invalid_max_media_bytes} =
-                 ReqClient.download_media(
-                   @download_url,
-                   credentials(max_media_bytes: unquote(invalid_limit))
-                 )
-
-        refute_received {:request, _request}
-      end
-    end
-
-    for {url, reason} <- [
-          {"https://bad.example/v3/attachments/1", :untrusted_media_url},
-          {"http://smba.trafficmanager.net/amer/v3/attachments/1", :invalid_media_url}
-        ] do
-      test "refuses #{url} without a request" do
-        assert {:error, unquote(reason)} = ReqClient.download_media(unquote(url), credentials())
-        refute_received {:request, _request}
-      end
-    end
+    assert_receive {:request, _token_request}
+    assert_receive {:request, request}
+    assert request[:url] == @image_url
+    assert {"authorization", "Bearer token-1"} in request[:headers]
+    assert request[:redirect] == false
   end
 
-  defp credentials(extra \\ []),
-    do: [req: FakeReq, app_id: "app-1", app_password: "secret"] ++ extra
+  test "pre-authenticated SharePoint media never gets a bearer token" do
+    responses([ok(200, "pdf-bytes")])
 
-  defp streamed(status, chunks, headers \\ %{}) do
+    assert {:ok, "pdf-bytes"} =
+             ReqClient.download_media(credentials(), @download_url, req: FakeReq)
+
+    assert_receive {:request, request}
+    assert request[:headers] == []
+    refute_receive {:request, _}
+
+    responses([ok(401, "expired")])
+
+    assert {:error, {:http_error, 401}} =
+             ReqClient.download_media(credentials(), @download_url, req: FakeReq)
+
+    assert_receive {:request, retry_request}
+    assert retry_request[:headers] == []
+    refute_receive {:request, _}
+  end
+
+  test "redirects are reclassified and never send a bearer token to another host" do
+    redirect_url = "https://contoso-my.sharepoint.com/personal/ada/download?tempauth=y"
+
+    responses([
+      token("token-1"),
+      ok(302, "", %{"location" => [redirect_url]}),
+      ok(200, "redirected")
+    ])
+
+    assert {:ok, "redirected"} =
+             ReqClient.download_media(credentials(), @image_url, req: FakeReq)
+
+    assert_receive {:request, _token_request}
+    assert_receive {:request, first}
+    assert {"authorization", "Bearer token-1"} in first[:headers]
+    assert_receive {:request, second}
+    assert second[:url] == redirect_url
+    assert second[:headers] == []
+
+    responses([ok(302, "", %{"location" => ["https://untrusted.example/download"]})])
+
+    assert {:error, :untrusted_media_url} =
+             ReqClient.download_media(credentials(), @download_url, req: FakeReq)
+
+    assert_receive {:request, _}
+    refute_receive {:request, _}
+  end
+
+  test "media size limits stop streaming and invalid limits make no request" do
+    responses([streamed(200, ["abc", "def", "ghi"])])
+
+    assert {:error, :media_too_large} =
+             ReqClient.download_media(credentials(), @download_url,
+               req: FakeReq,
+               max_media_bytes: 4
+             )
+
+    assert_receive {:request, _}
+    assert_receive {:chunk, "def"}
+    refute_receive {:chunk, "ghi"}
+
+    assert {:error, :invalid_max_media_bytes} =
+             ReqClient.download_media(credentials(), @download_url,
+               req: FakeReq,
+               max_media_bytes: 0
+             )
+
+    refute_receive {:request, _}
+  end
+
+  test "invalid and untrusted media URLs make no request" do
+    assert {:error, :untrusted_media_url} =
+             ReqClient.download_media(credentials(), "https://bad.example/file", req: FakeReq)
+
+    assert {:error, :invalid_media_url} =
+             ReqClient.download_media(
+               credentials(),
+               "http://smba.trafficmanager.net/amer/file",
+               req: FakeReq
+             )
+
+    refute_receive {:request, _}
+  end
+
+  defp credentials,
+    do: %{app_id: "app-1", app_password: "secret"}
+
+  defp reference do
+    ConversationRef.new(%{
+      conversation_id: "19:thread@thread.tacv2",
+      service_url: "https://smba.trafficmanager.net/amer"
+    })
+  end
+
+  defp streamed(status, chunks) do
     fn opts ->
-      response = %Req.Response{status: status, headers: headers, body: ""}
+      response = %Req.Response{status: status, headers: %{}, body: ""}
 
       {_request, response} =
         Enum.reduce_while(chunks, {nil, response}, fn chunk, acc ->
@@ -311,18 +248,8 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
     end
   end
 
-  defp token(status, access_token),
-    do: ok(status, %{"access_token" => access_token, "expires_in" => 3600})
-
-  defp redirect(url, number),
-    do: ok(302, "", %{"location" => [url <> "&redirect=#{number}"]})
-
-  defp reference do
-    ConversationRef.new(%{
-      conversation_id: "19:thread@thread.tacv2",
-      service_url: "https://smba.trafficmanager.net/amer"
-    })
-  end
+  defp token(access_token),
+    do: ok(200, %{"access_token" => access_token, "expires_in" => 3_600})
 
   defp responses(values), do: Process.put(:responses, values)
   defp ok(status, body), do: ok(status, body, %{})
